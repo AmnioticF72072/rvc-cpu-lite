@@ -173,8 +173,12 @@ GEN_T = 1024
 ```
 convert.py            命令行入口
 转换.bat              Windows 拖拽入口
+gui.py                Plus 图形界面（本机网页，双击 启动界面(Plus).bat）
 rvc_cpu/
   infer.py            主流水线：分块、f0、特征、protect 混合、RMS 对齐
+  models.py           音色模型库：导入 / 切换 / 删除 / 注册表（Plus 1.2）
+  calibrate.py        自动定档：测音高、算偶数半音移调
+  separate.py         分离调度（去和声 / 分人声，交给带 torch 的子进程）
   hw_profile.py       硬件探测，按 CPU 型号给线程数和后端
   mel.py              mel 频谱（纯 numpy，替掉 librosa）
   rmvpe.py            RMVPE 基频
@@ -182,9 +186,12 @@ rvc_cpu/
 tools/
   export_generator.py    .pth → 定长 ONNX
   export_contentvec.py   ContentVec → 动态 ONNX
+  _rvc_export_lib/       .pth 转换用的官方 RVC 2.2 模型代码（带 torch 2.9 补丁）
 docs/
-  models.md           模型从哪来
+  models.md           模型从哪来、怎么导入
   faq.md              报错对照表
+  PITFALLS.md         踩坑记录
+  RECIPES.md          参数从哪抄的
 ```
 
 ## 做不到的
@@ -192,7 +199,8 @@ docs/
 - 训练、微调：没有。要用官方 WebUI 或者 applio。
 - 实时变声：没有。这个走的是整段文件，块之间靠重叠裁剪接缝，延迟两三秒。
 - m4a / aac / wma：libsndfile 不认，先转 mp3 或 wav。
-- faiss 检索索引：代码留了接口（`--index`），但 faiss 得你自己装，我没打包进去。
+- faiss 检索索引：`pip install -r requirements.txt` 会一起装上（faiss-cpu），
+  但 `.index` 文件得你自己有——那是训练时生成的，仓库不附带。
 - OpenVINO / 核显 / NPU：`hw_profile.py` 里写了分支，但这台机器没有兼容的核显可测，
   跑不到那条路径。谁有 Lunar Lake 或者 Arc 的机器试通了，欢迎发 PR。
 

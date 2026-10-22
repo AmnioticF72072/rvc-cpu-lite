@@ -2,14 +2,16 @@
 
 RVC inference, ONNX only. No PyTorch, no fairseq, no CUDA. CPU.
 
-Dependencies are `numpy`, `onnxruntime`, `soundfile`, `soxr` — about 140 MB installed,
-versus 3.5 GB for a torch environment. The code here is a few hundred KB.
+Dependencies are `numpy`, `onnxruntime`, `soundfile`, `soxr`, `faiss-cpu` — about 140 MB
+installed, versus 3.5 GB for a torch environment. The code here is a few hundred KB.
 
 Measured on an i5-10400 (6C/12T, UHD 630, no dGPU): 20 s of input produced 20.00 s of output
 in 30 s wall clock, RTF 1.51. An i5-12400 should land around RTF 1.0 — that number is an
 estimate, I have not tested that CPU.
 
-Inference only. No training, no realtime, no source separation.
+Inference only. No training, no realtime. There is an optional separation pre-step
+(UVR Karaoke, to strip backing harmonics) that runs in a separate torch-enabled Python
+if you have one; without it the core conversion still works fine.
 
 ## Minimum hardware
 
@@ -78,7 +80,8 @@ pile of four-second fragments.
 - Training / fine-tuning: out of scope.
 - Realtime: no. Whole-file processing with overlap-trimmed chunk joins, a few seconds latency.
 - m4a / aac / wma: libsndfile does not read them, convert to mp3 or wav first.
-- faiss index retrieval: the hook exists (`--index`), faiss is not bundled.
+- faiss index retrieval: ships in requirements.txt now, but the `.index` file itself has to
+  come from your training run — nothing is bundled here.
 - OpenVINO / iGPU / NPU: branch exists in `hw_profile.py`, untested — I had no compatible
   hardware. PRs welcome.
 
