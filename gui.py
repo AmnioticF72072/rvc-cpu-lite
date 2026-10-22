@@ -26,14 +26,15 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 WORK = os.path.join(ROOT, "_工作区")
 OUT = os.path.join(ROOT, "输出")
 MODELS = os.path.join(ROOT, "models")
+MODEL_STAGE = os.path.join(WORK, "_导入暂存")
 PORT = int(os.environ.get("RVC_GUI_PORT", "8790"))
-VERSION = "Plus 1.0"
+VERSION = "Plus 1.2"
 
 sys.path.insert(0, ROOT)
 
 _lock = threading.Lock()
 _state = {
-    "stage": "idle",          # idle | analyzing | separating | loading | running | done | error
+    "stage": "idle",          # idle | analyzing | separating | loading | running | importing | done | error
     "frac": 0.0,
     "msg": "准备好了",
     "phase": "",
@@ -44,6 +45,7 @@ _state = {
     "model_ready": False,
     "analysis": None,
     "started_at": 0.0,
+    "imported": "",
 }
 _pipe = None
 _pipe_device = None
@@ -73,23 +75,18 @@ def get_state():
 
 # ---------------------------------------------------------------- 资源发现
 def model_paths():
-    def pick(*names):
-        for n in names:
-            p = os.path.join(MODELS, n)
-            if os.path.isfile(p):
-                return p
-        return ""
+    """当前激活模型的 (生成器, ContentVec, RMVPE, 索引)。"""
+    from rvc_cpu import models as mm
+    p = mm.paths_for()
+    return p["gen"], p["vec"], p["rmv"], p["idx"]
 
-    gen = pick("myvoice51.onnx", "voice.onnx", "generator.onnx")
-    vec = pick("vec768_dyn.onnx", "hubert_v2_768_dyn.onnx", "vec768.onnx", "contentvec.onnx")
-    rmv = pick("rmvpe.onnx")
-    idx = ""
-    for cand in ("myvoice51.index", "added_IVF256_Flat_nprobe_1.index", "voice.index"):
-        p = os.path.join(MODELS, cand)
-        if os.path.isfile(p):
-            idx = p
-            break
-    return gen, vec, rmv, idx
+
+def invalidate():
+    """模型切换 / 导入 / 删除后调用：丢掉已加载流水线与元数据缓存。"""
+    global _pipe, _pipe_device, _meta_cache
+    _pipe = None
+    _pipe_device = None
+    _meta_cache = None
 
 
 def meta():
@@ -97,6 +94,7 @@ def meta():
     global _meta_cache
     if _meta_cache is not None:
         return _meta_cache
+    from rvc_cpu import models as mm
     gen, vec, rmv, idx = model_paths()
     from rvc_cpu import separate as sep
     probe = sep.probe()
@@ -110,8 +108,11 @@ def meta():
             index_info["vectors"] = int(ix.ntotal)
         except Exception as e:
             index_info["error"] = str(e)[:80]
+    models, active = mm.list_models()
     _meta_cache = {
         "version": VERSION,
+        "active_model": active,
+        "model_list": models,
         "models": {
             "gen": os.path.basename(gen) if gen else "",
             "vec": os.path.basename(vec) if vec else "",
@@ -165,6 +166,7 @@ def ensure_pipeline(index_rate=0.0, device="auto"):
 def run_analyze(path):
     try:
         from rvc_cpu.calibrate import analyze_file, load_profile, suggest
+        from rvc_cpu import models as mm
 
         _, _, rmv, _ = model_paths()
         set_state(stage="analyzing", frac=0.05, msg="分析音高（第一次约 5~10 秒）…")
@@ -174,8 +176,7 @@ def run_analyze(path):
             set_state(stage="idle", frac=0, analysis=None,
                       msg="没检测到人声，这段可能是静音或纯伴奏")
             return
-        prof = load_profile(MODELS, os.path.splitext(os.path.basename(path))[0]
-                            if False else "myvoice51")
+        prof = load_profile(MODELS, mm.active_name() or "myvoice51")
         r = suggest(stats, prof)
         set_state(stage="idle", frac=0,
                   analysis={"stats": stats, "key": r["key"], "reason": r["reason"],
@@ -263,6 +264,26 @@ def run_job(files, key, index_rate, sep_mode, device="auto"):
             hint = "（音频太短，至少给 2 秒）"
         set_state(stage="error", error="%s%s" % (m, hint), msg="出错了")
         log("失败：" + m)
+        traceback.print_exc()
+
+
+# ---------------------------------------------------------------- 导入模型
+def run_import(name):
+    """把暂存目录里的模型文件导入 models 并切换过去（.pth 会自动转 ONNX）。"""
+    try:
+        from rvc_cpu import models as mm
+        set_state(stage="importing", frac=0.03, msg="准备导入…", error="", imported="")
+        info = mm.import_from_stage(
+            MODEL_STAGE, name,
+            progress=lambda f, m: set_state(stage="importing",
+                                            frac=round(0.03 + 0.94 * float(f), 3), msg=m))
+        invalidate()
+        set_state(stage="idle", frac=0, msg="已导入并切换到「%s」" % info["name"],
+                  imported=info["name"], analysis=None)
+        log("导入模型：%s（来源 %s）" % (info["name"], info.get("source") or "onnx"))
+    except Exception as e:
+        set_state(stage="error", error=str(e), msg="导入失败")
+        log("导入失败：" + str(e))
         traceback.print_exc()
 
 
@@ -411,6 +432,23 @@ PAGE = r"""<!doctype html>
 
   <div class="grid">
     <div>
+      <!-- 0 音色模型 -->
+      <div class="card">
+        <div class="step"><div class="num">0</div><h2>音色模型</h2>
+          <span class="opt">可导入别人的模型</span></div>
+        <p class="hint">当前用的是「<b id="curModel">—</b>」。可以导入其他人分享的 RVC 模型：
+          拖入 <b>.pth</b>（本机有 PyTorch 就自动转换）或 <b>.onnx</b> 都行，
+          有配套 .index 一起放，音色会更像。</p>
+        <div class="seg" id="segModel"></div>
+        <div class="row" style="margin-top:10px;gap:10px">
+          <button class="btn mini ghost" id="btnImport">导入模型…</button>
+          <button class="btn mini ghost" id="btnDelModel">删除这个</button>
+          <span id="modelInfo" style="font-size:12px;color:#7a8899;text-align:right;flex:1"></span>
+        </div>
+        <input type="file" id="modelPicker" accept=".pth,.onnx,.json,.index" multiple hidden>
+        <div class="warn" id="modelWarn"></div>
+      </div>
+
       <!-- 1 选文件 -->
       <div class="card">
         <div class="step"><div class="num">1</div><h2>选一个音频</h2></div>
@@ -536,8 +574,12 @@ PAGE = r"""<!doctype html>
           <p>先确认输入是干净人声；再检查移调是不是拉太狠（超过 ±8 半音容易失真）；
              音色接近度调到 0.5 试试。</p></details>
         <details><summary>能换别人的音色模型吗？</summary>
-          <p>把新的 .onnx 和同名 .json 放进 models，改名成 myvoice51.onnx / myvoice51.json 覆盖
-             （覆盖前先备份）。有配套 .index 也一起放进去，会自启用检索。</p></details>
+          <p>点最上面「音色模型」卡片里的「导入模型…」，把下到的模型文件拖进去就行：<br>
+             · <b>.pth</b>（最常见的分享格式）：本机装有 PyTorch 时会自动转换成 ONNX 再用；
+               没有 PyTorch 会提示你先弄一个，或者直接要 .onnx 格式。<br>
+             · <b>.onnx</b>：直接可用，建议连同名 .json（采样率等配置）一起导入。<br>
+             · <b>.index</b>：可选，放进后自动启用特征检索。<br>
+             注意只支持 v2 模型（768 维）。导入后会自动切换成新模型，原来的模型还在，随时切回来。</p></details>
         <details><summary>这一步会联网吗？</summary>
           <p>不会。界面是本机网页（127.0.0.1），音频不上传。
              唯一可能联网的是第一次用「去和声」时下载 Karaoke 模型。</p></details>
@@ -548,7 +590,7 @@ PAGE = r"""<!doctype html>
 
 <script>
 const $ = s => document.querySelector(s);
-let picked = null, timer = null, meta = null, autoKey = null;
+let picked = null, timer = null, meta = null, autoKey = null, lastImported = '';
 
 function setPicked(name){
   picked = name;
@@ -559,10 +601,11 @@ function setPicked(name){
 
 async function loadMeta(){
   meta = await (await fetch('/api/meta')).json();
+  renderModels(meta);
   const s = meta.sep || {};
   const parts = [];
   parts.push(meta.version);
-  if (meta.models && meta.models.gen) parts.push(meta.models.gen.replace('.onnx',''));
+  if (meta.active_model) parts.push(meta.active_model);
   parts.push(meta.index ? '检索已启用' : '无检索索引');
   $('#badge').textContent = parts.join(' · ');
 
@@ -587,6 +630,99 @@ async function loadMeta(){
     warn.classList.add('on');
   }
 }
+
+// ---------------------------------------------------------------- 模型管理
+function renderModels(m){
+  const box = $('#segModel');
+  const list = (m && m.model_list) || [];
+  box.innerHTML = '';
+  if (!list.length){
+    box.innerHTML = '<span style="font-size:12.5px;color:#9a6b00">models 目录里没有音色模型。' +
+      '点「导入模型…」导入一个，或确认整个文件夹是一起解压的。</span>';
+    $('#curModel').textContent = '无';
+    $('#modelInfo').textContent = '';
+    $('#btnDelModel').style.display = 'none';
+    return;
+  }
+  list.forEach(mm => {
+    const lb = document.createElement('label');
+    const inp = document.createElement('input');
+    inp.type = 'radio'; inp.name = 'mdl'; inp.value = mm.name;
+    if (mm.active) inp.checked = true;
+    const sp = document.createElement('span');
+    sp.textContent = mm.name;
+    if (mm.index){
+      const sm = document.createElement('small');
+      sm.textContent = '带索引';
+      sp.appendChild(sm);
+    }
+    lb.appendChild(inp); lb.appendChild(sp);
+    box.appendChild(lb);
+  });
+  const cur = list.find(x => x.active) || list[0];
+  $('#curModel').textContent = cur.name;
+  const bits = [cur.mb + ' MB'];
+  if (cur.tgt_sr) bits.push(cur.tgt_sr + ' Hz');
+  if (cur.version) bits.push(cur.version);
+  if (cur.source) bits.push(cur.source === 'pth' ? '.pth 导入' : '.onnx 导入');
+  if (cur.imported_at) bits.push(cur.imported_at.slice(5, 10) + ' 导入');
+  $('#modelInfo').textContent = bits.join(' · ');
+  $('#btnDelModel').style.display = list.length > 1 ? 'inline-flex' : 'none';
+  box.querySelectorAll('input[name=mdl]').forEach(r => {
+    r.onchange = async () => {
+      if (r.value === (meta.active_model || '')) return;
+      if (!confirm('切换到模型「' + r.value + '」？\n（当前模型不会删掉，随时可以切回来）')){
+        renderModels(meta); return;
+      }
+      const j = await (await fetch('/api/model/select', {method:'POST',
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:r.value})})).json();
+      if (j.ok){
+        meta = await (await fetch('/api/meta')).json();
+        renderModels(meta);
+        $('#pmsg').textContent = '已切换到「' + r.value + '」，下次转换用新模型';
+      } else {
+        $('#pmsg').textContent = '切换失败：' + j.error;
+        renderModels(meta);
+      }
+    };
+  });
+}
+
+$('#btnImport').onclick = () => $('#modelPicker').click();
+$('#modelPicker').onchange = async e => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  if (!files.length) return;
+  const base = (files.find(f => /\.(pth|onnx)$/i.test(f.name)) || files[0]).name.replace(/\.[^.]+$/, '');
+  for (const f of files){
+    $('#pmsg').textContent = '正在读入 ' + f.name + ' …';
+    try {
+      const r = await fetch('/api/model/stage?name=' + encodeURIComponent(f.name),
+                            {method:'POST', body:f});
+      const j = await r.json();
+      if (!j.ok){ $('#pmsg').textContent = '读入失败：' + j.error; return; }
+    } catch (err) {
+      $('#pmsg').textContent = '读入失败：' + err; return;
+    }
+  }
+  $('#pmsg').textContent = '开始导入模型…';
+  await fetch('/api/model/import', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name: base})});
+  poll();
+};
+
+$('#btnDelModel').onclick = async () => {
+  const cur = $('#curModel').textContent;
+  if (!cur || cur === '无') return;
+  if (!confirm('确定删除模型「' + cur + '」？\n会删掉 models 目录里它的 .onnx / .json / .index 文件，不可恢复。')) return;
+  const j = await (await fetch('/api/model/delete', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:cur})})).json();
+  if (j.ok){
+    meta = await (await fetch('/api/meta')).json();
+    renderModels(meta);
+    $('#pmsg').textContent = '已删除「' + cur + '」';
+  } else $('#pmsg').textContent = '删除失败：' + j.error;
+};
 
 $('#drop').onclick = () => $('#picker').click();
 $('#picker').onchange = async e => {
@@ -665,6 +801,12 @@ $('#playOut').onclick = () => play('out');
 async function poll(){
   clearTimeout(timer);
   const s = await (await fetch('/api/state')).json();
+  if (s.imported && s.imported !== lastImported){
+    lastImported = s.imported;
+    meta = await (await fetch('/api/meta')).json();
+    renderModels(meta);
+    $('#pmsg').textContent = '已导入并切换到「' + s.imported + '」';
+  }
   const p = Math.round((s.frac||0)*100);
   $('#bar').style.width = p+'%';
   $('#pct').textContent = p+'%';
@@ -686,7 +828,7 @@ async function poll(){
     if(autoKey !== a.key){ autoKey = a.key; setKey(a.key, true); }
   }
 
-  if(['analyzing','separating','loading','running'].includes(s.stage)){
+  if(['analyzing','separating','loading','running','importing'].includes(s.stage)){
     timer = setTimeout(poll, 400);
     return;
   }
@@ -798,6 +940,35 @@ class Handler(BaseHTTPRequestHandler):
                       outputs=[])
             return self._json({"ok": True, "name": safe, "count": len(q)})
 
+        # 模型文件暂存上传：必须放在下面通用读 body 之前，自己读流。
+        # （放在后面的复选框里再读一次 rfile 会永久阻塞：keep-alive 连接不会 EOF）
+        if u.path == "/api/model/stage":
+            name = unquote(parse_qs(u.query).get("name", ["model.bin"])[0])
+            try:
+                if any(0x80 <= ord(c) <= 0xFF for c in name):
+                    name = name.encode("latin-1").decode("utf-8")
+            except Exception:
+                pass
+            if n <= 0:
+                return self._json({"ok": False, "error": "文件是空的"})
+            if n > 3 * 1024 * 1024 * 1024:
+                return self._json({"ok": False, "error": "文件超过 3GB"})
+            os.makedirs(MODEL_STAGE, exist_ok=True)
+            safe = re.sub(r"[\\/:*?\"<>|]", "_", os.path.basename(name))
+            dst = os.path.join(MODEL_STAGE, safe)
+            left = n
+            with open(dst, "wb") as f:
+                while left > 0:
+                    buf = self.rfile.read(min(1 << 20, left))
+                    if not buf:
+                        break
+                    f.write(buf)
+                    left -= len(buf)
+            staged = [x for x in os.listdir(MODEL_STAGE)
+                      if os.path.isfile(os.path.join(MODEL_STAGE, x))]
+            log("暂存模型文件：%s（%.1f MB）" % (safe, n / 1024 ** 2))
+            return self._json({"ok": True, "name": safe, "staged": staged})
+
         body = self.rfile.read(n) if n else b"{}"
         try:
             payload = json.loads(body or b"{}")
@@ -808,7 +979,7 @@ class Handler(BaseHTTPRequestHandler):
             p = get_state()["input"]
             if not p or not os.path.isfile(p):
                 return self._json({"ok": False, "error": "还没有选文件"})
-            if get_state()["stage"] in ("running", "loading", "separating", "analyzing"):
+            if get_state()["stage"] in ("running", "loading", "separating", "analyzing", "importing"):
                 return self._json({"ok": False, "error": "正在忙，等一下"})
             set_state(stage="analyzing", frac=0.05, msg="开始分析…", error="")
             threading.Thread(target=run_analyze, args=(p,), daemon=True).start()
@@ -819,7 +990,7 @@ class Handler(BaseHTTPRequestHandler):
             p = st["input"]
             if not p or not os.path.isfile(p):
                 return self._json({"ok": False, "error": "还没有选文件"})
-            if st["stage"] in ("running", "loading", "separating", "analyzing"):
+            if st["stage"] in ("running", "loading", "separating", "analyzing", "importing"):
                 return self._json({"ok": False, "error": "正在忙，等一下"})
             key = int(payload.get("key", 0))
             rate = float(payload.get("index_rate", 0.0))
@@ -854,6 +1025,41 @@ class Handler(BaseHTTPRequestHandler):
                     os.makedirs(OUT, exist_ok=True)
                     os.startfile(OUT)
                 return self._json({"ok": True})
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)})
+
+        # ---------------------------------------------------------------- 模型管理
+        if u.path == "/api/model/import":
+            st = get_state()
+            if st["stage"] in ("running", "loading", "separating", "analyzing", "importing"):
+                return self._json({"ok": False, "error": "正在忙，等一下"})
+            if not os.path.isdir(MODEL_STAGE) or not os.listdir(MODEL_STAGE):
+                return self._json({"ok": False, "error": "先选择要导入的模型文件"})
+            nm = str(payload.get("name") or "").strip()
+            set_state(stage="importing", frac=0.02, msg="准备导入…",
+                      error="", imported="")
+            threading.Thread(target=run_import, args=(nm,), daemon=True).start()
+            return self._json({"ok": True})
+
+        if u.path == "/api/model/select":
+            nm = str(payload.get("name") or "").strip()
+            try:
+                from rvc_cpu import models as mm
+                r = mm.set_active(nm)
+                invalidate()
+                log("切换模型：" + nm)
+                return self._json({"ok": True, "active": r["active"]})
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)})
+
+        if u.path == "/api/model/delete":
+            nm = str(payload.get("name") or "").strip()
+            try:
+                from rvc_cpu import models as mm
+                r = mm.delete_model(nm)
+                invalidate()
+                log("删除模型：%s（%s）" % (nm, ", ".join(r["removed"])))
+                return self._json({"ok": True, "removed": r["removed"]})
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)})
 
@@ -913,11 +1119,16 @@ def main():
         return
 
     gen, vec, rmv, idx = model_paths()
+    from rvc_cpu import models as mm
+    ms, active = mm.list_models()
     print("=" * 60)
     print(" 声音转换 %s" % VERSION)
     print(" 模型目录：" + MODELS)
     for n, p in (("生成器", gen), ("ContentVec", vec), ("RMVPE", rmv), ("检索索引", idx)):
         print("   %-10s %s" % (n, os.path.basename(p) if p else "无"))
+    if len(ms) > 1:
+        print(" 音色模型 %d 个（当前：%s）：%s" %
+              (len(ms), active, "、".join(m["name"] for m in ms)))
     print(" 输出目录：" + OUT)
     print(" 界面地址：" + url)
     print("=" * 60)

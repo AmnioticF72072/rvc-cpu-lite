@@ -176,6 +176,16 @@ class RvcPipeline:
         self.t_query = SR16K * X_QUERY
         self.t_center = SR16K * X_CENTER
         self.t_max = SR16K * X_MAX
+        # gen_T 自检：convert_file 的分块步长 max_step = (gen_T - t_pad2/window - 2)*window
+        # 必须大于最小段长 1.5s，否则每块的 3s 上下文裁剪会把真声吃光
+        # （"12 秒进去 1 秒出来"）。gen_T 太小（如 256）的模型在这里直接拒绝。
+        _max_step = (self.gen_T - self.t_pad2 // self.window - 2) * self.window
+        if _max_step < int(1.5 * SR16K):
+            raise RuntimeError(
+                "模型定长帧数 gen_T=%d 太小（分块步长只有 %.2f 秒，小于最小段长 1.5 秒）。"
+                "这个 ONNX 是按 --T %d 导出的，请按 --T 1024 重新导出，"
+                "或直接导入 .pth 让本工具自动转换。" %
+                (self.gen_T, _max_step / SR16K, self.gen_T))
         # 默认值对齐 docs/RECIPES.md：
         #   protect 0.33→调用方传 0.10（唱歌），rms_mix_rate 0.25→0.40
         #   rms_mix_rate 就是 volume_envelope 的实现：越大越跟随源音量包络。

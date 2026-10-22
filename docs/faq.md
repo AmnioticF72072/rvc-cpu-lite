@@ -59,3 +59,25 @@ ContentVec 收到了一段太短的音频。常见于切点算到文件末尾，
 
 VC++ 运行库缺失，或者 Python 位数不对（32 位解释器加载不了 64 位 wheel）。
 装一下 Microsoft Visual C++ Redistributable 2015-2022。
+
+## 导入模型时报「gen_T 太小」（Plus 1.2）
+
+```
+模型定长帧数 gen_T=256 太小（分块步长只有 0.54 秒，小于最小段长 1.5 秒）
+```
+
+这个 ONNX 是按 `--T 256` 之类的小帧数导出的。分块步长
+`(gen_T - 202) * 160` 小于 1.5 秒最小段长时，每块头尾各裁的 3 秒上下文会把真声吃光——
+实测 12 秒音频只出 1.1 秒。按 `--T 1024` 重新导出，或直接导入 `.pth`
+（Plus 1.2 的界面导入固定按 1024 导）。
+
+## 导入 .pth 时报「没找到 PyTorch」（Plus 1.2）
+
+转 `.pth` 需要本机有装了 torch 的 Python。两条路：直接导入 `.onnx` 格式的模型
+（不用转换）；或在有 torch 的电脑上跑 `tools/export_gen_onnx2.py` 得到 `.onnx` 再拿过来。
+界面会自动按 `.venv` → `../env/rvc` → `G:/AIVoice/env/rvc` → PATH 的顺序找。
+
+## 导入报「这是 v1 老模型」（Plus 1.2）
+
+v1 模型用 256 维 hubert soft 底座，本版只带 768 维 ContentVec，喂不进去。
+下载标注 v2 的模型即可。

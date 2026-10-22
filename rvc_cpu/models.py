@@ -1,0 +1,437 @@
+# -*- coding: utf-8 -*-
+"""模型管理中心：列出 / 切换 / 导入音色模型（Plus 1.2 新增）
+
+背景：Plus 1.0/1.1 只认死文件名 myvoice51.onnx，换模型要手动改名覆盖，
+      想用别人训练的模型很别扭。这个模块把 models 目录变成"模型库"：
+
+  - 每个音色模型 = <名字>.onnx（生成器）+ 同名 .json（旁挂配置：tgt_sr/gen_T）
+    + 可选同名 .index（特征检索）+ 可选同名 .pitch.json（音域画像，给自动校准用）
+  - vec768_dyn.onnx / rmvpe.onnx 是全库共享的底座，不随模型切换
+  - models/registry.json 记录"当前用哪个"和每个模型的导入来源
+
+导入支持两种形态（GUI 上就是一个"导入模型"按钮）：
+  ① .onnx（+ .json / .index）—— 别的导出工具产出的，直接复制进 models
+  ② .pth —— RVC 官方/applio 的训练产物，调用 tools/export_gen_onnx2.py
+     转成 ONNX 再注册（需要本机有装了 torch 的 python，没有就明确报错，
+     不静默失败）。.pth 转换走 vendor 在 tools/_rvc_export_lib 里的官方
+     SynthesizerTrnMsNSFsidM（RVC 2.2.231006，MIT），不依赖外部仓库。
+
+只支持 v2（768 维 ContentVec）模型：v1 老模型用 256 维 hubert soft 底座，
+本版没打包那个底座，导入时会明确拒绝并说明原因。
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODELS = os.path.join(ROOT, "models")
+REGISTRY = os.path.join(MODELS, "registry.json")
+EXPORT_SCRIPT = os.path.join(ROOT, "tools", "export_gen_onnx2.py")
+VENDORED_LIB = os.path.join(ROOT, "tools", "_rvc_export_lib")
+
+# 底座模型（共享，不算音色模型）
+_BASES = ("vec768_dyn", "hubert_v2_768_dyn", "vec768", "contentvec", "rmvpe")
+
+_UNSAFE = re.compile(r"[\\/:*?\"<>|\x00-\x1f]")
+
+
+def _sanitize(name):
+    """模型名 safe 化：去掉路径字符，限长 40。允许中文。"""
+    name = _UNSAFE.sub("_", (name or "").strip())
+    name = re.sub(r"\s+", " ", name)[:40].strip(" .")
+    return name
+
+
+# ---------------------------------------------------------------- 注册表
+def _load():
+    reg = {"active": "", "models": {}}
+    try:
+        with open(REGISTRY, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            reg.update(d)
+    except Exception:
+        pass
+    return reg
+
+
+def _save(reg):
+    os.makedirs(MODELS, exist_ok=True)
+    tmp = REGISTRY + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(reg, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, REGISTRY)
+
+
+def _read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------- 查询
+def list_models():
+    """扫 models 目录，合并注册表元数据。返回列表（不含底座）。"""
+    reg = _load()
+    stems = []
+    if os.path.isdir(MODELS):
+        for fn in sorted(os.listdir(MODELS)):
+            if not fn.lower().endswith(".onnx"):
+                continue
+            stem = fn[:-5]
+            if stem.lower() in _BASES:
+                continue
+            stems.append(stem)
+
+    out = []
+    for stem in stems:
+        j = os.path.join(MODELS, stem + ".json")
+        ix = os.path.join(MODELS, stem + ".index")
+        pitch = os.path.join(MODELS, stem + ".pitch.json")
+        cfg = _read_json(j) if os.path.isfile(j) else {}
+        meta = dict(reg["models"].get(stem) or {})
+        mb = 0.0
+        try:
+            mb = round(os.path.getsize(os.path.join(MODELS, stem + ".onnx")) / 1024 ** 2, 1)
+        except Exception:
+            pass
+        out.append({
+            "name": stem,
+            "mb": mb,
+            "tgt_sr": cfg.get("tgt_sr") or cfg.get("sr") or "",
+            "version": cfg.get("version") or "",
+            "f0": bool(cfg.get("f0", True)),
+            "index": os.path.basename(ix) if os.path.isfile(ix) else "",
+            "index_mb": round(os.path.getsize(ix) / 1024 ** 2, 1) if os.path.isfile(ix) else 0,
+            "pitch_profile": os.path.isfile(pitch),
+            "source": meta.get("source") or "",
+            "imported_at": meta.get("imported_at") or "",
+            "origin": meta.get("origin") or "",
+        })
+
+    active = reg.get("active") or ""
+    if active and not any(m["name"] == active for m in out):
+        active = ""
+    if not active:
+        # 没登记过：优先内置的 myvoice51，否则第一个
+        for m in out:
+            if m["name"] == "myvoice51":
+                active = m["name"]
+                break
+        if not active and out:
+            active = out[0]["name"]
+    for m in out:
+        m["active"] = (m["name"] == active)
+    return out, active
+
+
+def active_name():
+    return list_models()[1]
+
+
+def paths_for(name=""):
+    """返回 {gen, vec, rmv, idx}。name 为空用当前激活模型。"""
+    models, active = list_models()
+    name = name or active
+    pick = None
+    for m in models:
+        if m["name"] == name:
+            pick = m
+            break
+    if pick is None and models:
+        pick = models[0]
+        name = pick["name"]
+
+    def shared(*cands):
+        for c in cands:
+            p = os.path.join(MODELS, c)
+            if os.path.isfile(p):
+                return p
+        return ""
+
+    gen = os.path.join(MODELS, name + ".onnx") if name else ""
+    if not os.path.isfile(gen):
+        gen = ""
+    return {
+        "gen": gen,
+        "vec": shared("vec768_dyn.onnx", "hubert_v2_768_dyn.onnx", "vec768.onnx", "contentvec.onnx"),
+        "rmv": shared("rmvpe.onnx"),
+        "idx": os.path.join(MODELS, name + ".index") if name else "",
+    }
+
+
+def set_active(name):
+    models, active = list_models()
+    if not any(m["name"] == name for m in models):
+        raise RuntimeError("模型「%s」不存在" % name)
+    if name == active:
+        return {"ok": True, "active": name}
+    reg = _load()
+    reg["active"] = name
+    _save(reg)
+    return {"ok": True, "active": name}
+
+
+def delete_model(name):
+    """删除一个音色模型的 onnx/json/index/pitch.json（单个、显式调用）。"""
+    models, active = list_models()
+    if not any(m["name"] == name for m in models):
+        raise RuntimeError("模型「%s」不存在" % name)
+    if len(models) <= 1:
+        raise RuntimeError("这是最后一个模型，删了就没了")
+    removed = []
+    for ext in (".onnx", ".json", ".index", ".pitch.json"):
+        p = os.path.join(MODELS, name + ext)
+        if os.path.isfile(p):
+            os.remove(p)
+            removed.append(os.path.basename(p))
+    reg = _load()
+    reg["models"].pop(name, None)
+    if reg.get("active") == name:
+        reg["active"] = ""
+    _save(reg)
+    return {"ok": True, "removed": removed}
+
+
+# ---------------------------------------------------------------- 导入
+def _has_module(py, mod):
+    """不真的 import（torch 太慢），看 site-packages 里有没有目录。"""
+    if not py or not os.path.isfile(py):
+        return False
+    base = os.path.dirname(os.path.dirname(py))
+    for sp in (os.path.join(base, "Lib", "site-packages"),
+               os.path.join(base, "lib", "python3.10", "site-packages"),
+               os.path.join(base, "lib", "python3.11", "site-packages"),
+               os.path.join(base, "lib", "python3.12", "site-packages")):
+        if not os.path.isdir(sp):
+            continue
+        import glob
+        if glob.glob(os.path.join(sp, mod + "*")):
+            return True
+    return False
+
+
+def find_torch_python():
+    """找一个装了 torch 的 python（转换 .pth 用）。找不到返回空串。"""
+    cands = [
+        os.path.join(ROOT, ".venv", "Scripts", "python.exe"),
+        os.path.join(ROOT, "..", "env", "rvc", "Scripts", "python.exe"),
+        r"G:\AIVoice\env\rvc\Scripts\python.exe",
+    ]
+    try:
+        import shutil
+        w = shutil.which("python")
+        if w:
+            cands.insert(0, w)
+    except Exception:
+        pass
+    seen = set()
+    for py in cands:
+        if not py or py.lower() in seen:
+            continue
+        seen.add(py.lower())
+        if os.path.isfile(py) and _has_module(py, "torch"):
+            return py
+    return ""
+
+
+# 导入的 .pth 统一按 T=1024 导出（与内置模型一致、经过完整验证）。
+# T 太小会让分块步长 < 1.5s 最小段长，每块的 3s 上下文裁剪会把真声吃光
+# （表现为"12 秒进去 1 秒出来"）。推理端也有 gen_T 自检兜底。
+EXPORT_T = "1024"
+# 直接导入 .onnx 时的 gen_T 下限：保证 max_step = (T-202)*160 > 1.5s 最小段长
+GEN_T_MIN = 512
+
+
+def _export_pth(pth_path, out_onnx, progress=None):
+    """调 tools/export_gen_onnx2.py 把 .pth 转成 ONNX（需要 torch python）。"""
+    def _p(f, m):
+        if progress:
+            try:
+                progress(f, m)
+            except Exception:
+                pass
+
+    py = find_torch_python()
+    if not py:
+        raise RuntimeError(
+            "转 .pth 需要本机装有 PyTorch 的 Python，但没找到。\n"
+            "两个办法：① 直接导入 .onnx 格式的模型（不用转换）；\n"
+            "② 在有 torch 的电脑上跑 tools/export_gen_onnx2.py 得到 .onnx 再拿过来。")
+    _p(0.15, "找到 PyTorch 环境，开始转换（大模型要几分钟）…")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = VENDORED_LIB + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONUNBUFFERED"] = "1"
+    cmd = [py, EXPORT_SCRIPT, "--pth", pth_path, "--out", out_onnx, "--T", EXPORT_T]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
+                           env=env, timeout=3600, cwd=ROOT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("转换超时（1 小时）。模型太大或机器太慢")
+    if r.returncode != 0 or not os.path.isfile(out_onnx):
+        tail = (r.stderr or r.stdout or "").strip().splitlines()
+        raise RuntimeError("转换失败：%s" % (tail[-1] if tail else "未知错误"))
+    # v1 老模型检查：v1 用 256 维 hubert 底座，本版只有 768 维 ContentVec
+    side = _read_json(os.path.splitext(out_onnx)[0] + ".json")
+    if side.get("version") == "v1":
+        try:
+            os.remove(out_onnx)
+        except Exception:
+            pass
+        raise RuntimeError(
+            "这是 v1 老模型（256 维特征）。本版只支持 v2 模型（768 维 ContentVec）。\n"
+            "请下载标注 v2 的模型，或用完整版 RVC  WebUI 转换后再导出。")
+    _p(0.55, "转换完成，正在登记…")
+
+
+def _introspect_onnx(path):
+    """不加载权重，从 ONNX 图里读 gen_T / vec_channels / tgt_sr（尽力而为）。"""
+    info = {"gen_T": 1024, "vec_channels": 768, "tgt_sr": 48000}
+    try:
+        import onnxruntime as ort
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        for i in sess.get_inputs():
+            shp = i.shape
+            if i.name == "phone" and len(shp) == 3:
+                try:
+                    info["gen_T"] = int(shp[1])
+                except Exception:
+                    pass
+                try:
+                    info["vec_channels"] = int(shp[2])
+                except Exception:
+                    pass
+        meta = sess.get_modelmeta().custom_metadata_map or {}
+        if "config" in meta:
+            try:
+                info["tgt_sr"] = int(json.loads(meta["config"])[-1])
+            except Exception:
+                pass
+        del sess
+    except Exception:
+        pass
+    return info
+
+
+def _write_minimal_json(onnx_path, stem):
+    """没有旁挂 .json 时，根据 ONNX 图推断着写一个（推理端优先读它）。"""
+    info = _introspect_onnx(onnx_path)
+    side = os.path.splitext(onnx_path)[0] + ".json"
+    cfg = {"model_name": stem, "gen_T": info["gen_T"], "tgt_sr": info["tgt_sr"],
+           "vec_channels": info["vec_channels"],
+           "version": "v2" if info["vec_channels"] == 768 else "v1",
+           "f0": True, "note": "由 Plus 导入时自动生成，tgt_sr 为推断值"}
+    with open(side, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=1)
+    return cfg
+
+
+def import_from_stage(stage_dir, name="", progress=None):
+    """从暂存目录导入模型。stage_dir 里放 .pth 或 .onnx（.json/.index/.pitch.json 可选）。
+
+    返回导入成功的模型信息字典；失败抛 RuntimeError（消息直接给用户看）。
+    """
+    def _p(f, m):
+        if progress:
+            try:
+                progress(float(f), str(m))
+            except Exception:
+                pass
+
+    files = sorted(os.listdir(stage_dir)) if os.path.isdir(stage_dir) else []
+    if not files:
+        raise RuntimeError("没有待导入的文件")
+    pth = [f for f in files if f.lower().endswith(".pth")]
+    onnx = [f for f in files if f.lower().endswith(".onnx")]
+    js = [f for f in files if f.lower().endswith(".json")]
+    idx = [f for f in files if f.lower().endswith(".index")]
+    if not pth and not onnx:
+        raise RuntimeError("导入需要一个 .onnx 或 .pth 模型文件（.json / .index 可选）")
+
+    base = name or (pth[0] if pth else onnx[0])
+    stem = _sanitize(os.path.splitext(base)[0])
+    if not stem:
+        raise RuntimeError("模型名无效：%s" % base)
+    dst_onnx = os.path.join(MODELS, stem + ".onnx")
+    if os.path.exists(dst_onnx):
+        raise RuntimeError("models 里已经有「%s」了。先把那个模型删掉，或者给这个模型换个名字" % stem)
+
+    os.makedirs(MODELS, exist_ok=True)
+    try:
+        if pth:
+            _p(0.08, "开始转换 .pth → ONNX…")
+            _export_pth(os.path.join(stage_dir, pth[0]), dst_onnx, _p)
+        else:
+            _p(0.25, "正在复制模型文件（%s）…" % onnx[0])
+            shutil.copyfile(os.path.join(stage_dir, onnx[0]), dst_onnx)
+
+        # 旁挂配置：pitch 画像单独放，其余当 side config
+        side_done = False
+        for f in js:
+            if "pitch" in f.lower():
+                shutil.copyfile(os.path.join(stage_dir, f),
+                                os.path.join(MODELS, stem + ".pitch.json"))
+            else:
+                shutil.copyfile(os.path.join(stage_dir, f),
+                                os.path.join(MODELS, stem + ".json"))
+                side_done = True
+        if not side_done and not os.path.isfile(os.path.join(MODELS, stem + ".json")):
+            _p(0.65, "生成旁挂配置…")
+            _write_minimal_json(dst_onnx, stem)
+
+        # gen_T 自检：太小会把真声裁光（详见 EXPORT_T 注释）
+        side = _read_json(os.path.join(MODELS, stem + ".json"))
+        try:
+            gen_t = int(side.get("gen_T") or 0)
+        except Exception:
+            gen_t = 0
+        if gen_t and gen_t < GEN_T_MIN:
+            raise RuntimeError(
+                "这个 ONNX 的定长帧数只有 %d（需要 ≥%d）。它是按 --T %d 导出的，"
+                "请按 --T 1024 重新导出；或者直接导入 .pth，让本工具自动转换。"
+                % (gen_t, GEN_T_MIN, gen_t))
+
+        if idx:
+            _p(0.75, "复制特征索引…")
+            shutil.copyfile(os.path.join(stage_dir, idx[0]),
+                            os.path.join(MODELS, stem + ".index"))
+
+        _p(0.9, "登记并切换…")
+        reg = _load()
+        reg["models"][stem] = {
+            "source": "pth" if pth else "onnx",
+            "imported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "origin": pth[0] if pth else onnx[0],
+        }
+        reg["active"] = stem
+        _save(reg)
+    except Exception:
+        # 失败清掉半成品，别留垃圾
+        for ext in (".onnx", ".json", ".index", ".pitch.json"):
+            p = os.path.join(MODELS, stem + ext)
+            if os.path.isfile(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+        raise
+
+    # 清暂存（自己产生的临时文件）
+    for f in files:
+        try:
+            os.remove(os.path.join(stage_dir, f))
+        except Exception:
+            pass
+    _p(1.0, "完成")
+    models, active = list_models()
+    info = next((m for m in models if m["name"] == stem), {"name": stem})
+    return info

@@ -45,7 +45,23 @@ x = out[0] if isinstance(out, tuple) else out
 **注意 `--T`。** 模型是按这个帧数定长导出的，推理端 `GEN_T` 必须跟它一致。
 改了一个不改另一个，会报 `Reshape ... size was false`。
 
-## 二、ContentVec（vec768_dyn.onnx）
+## 二、不想敲命令：用界面导入（Plus 1.2）
+
+Plus 版图形界面最上面那张「音色模型」卡片，点「导入模型…」把文件拖进去就行：
+
+- `.pth`：自动调用 `tools/export_gen_onnx2.py`（就是第一节那套导出逻辑，
+  官方模型代码已随包 vendor 在 `tools/_rvc_export_lib`，不用再指 `--rvc`）。
+  前提是本机有装了 torch 的 Python，界面会自动找，找不到会明确提示。
+- `.onnx`：直接复制进 `models/`；没有旁挂 `.json` 时，会从 ONNX 图里推断
+  `gen_T` / `vec_channels` / `tgt_sr` 并补写一个（`tgt_sr` 推断不到就按 48k 记，
+  所以有 `.json` 还是一起放）。
+- `.index`：可选，放进去自动启用特征检索。
+
+导入后即切换；多个模型并存，`models/registry.json` 记录当前用哪个。
+v1 模型和 `gen_T < 512` 的 ONNX 会被拒绝并说明原因（前者底座维度不对，
+  后者输出会被上下文裁光）。
+
+## 三、ContentVec（vec768_dyn.onnx）
 
 要 transformers 格式的 ContentVec 目录（`config.json` + 权重文件，768 维）。
 applio 里一般躺在 `rvc/models/embedders/contentvec/`。
@@ -62,7 +78,7 @@ python tools/export_contentvec.py \
 如果你手上有的是 `.pt` 形式的 hubert/ContentVec，得先转成 transformers 格式，
 或者用官方的 `hubert_base.pt` 加 RVC 自己的加载代码包一层，再走同样的 `torch.onnx.export`。
 
-## 三、RMVPE（rmvpe.onnx）
+## 四、RMVPE（rmvpe.onnx）
 
 两条路：
 
