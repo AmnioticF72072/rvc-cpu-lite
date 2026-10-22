@@ -1,6 +1,6 @@
 {
-  "versionCode": 6,
-  "versionName": "0.5.1",
+  "versionCode": 7,
+  "versionName": "0.6.0",
   "url": "https://github.com/AmnioticF72072/rvc-cpu-lite/releases",
-  "notes": "排障版：长按版本号一键自检；完整堆栈写文件；修检查更新（多源回退）；修解压/解码兜底"
+  "notes": "修复转换必崩：RMVPE 帧数补齐到 32 倍数；末块补齐到 1024 帧；f0 与音频网格对齐"
 }
