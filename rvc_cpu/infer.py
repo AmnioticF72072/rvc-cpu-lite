@@ -58,6 +58,33 @@ def _cpu_session(model_path, intra_threads):
                                 providers=["CPUExecutionProvider"])
 
 
+# 可选加速后端：按"覆盖面 → 速度"排序。
+# 这三个都是 onnxruntime 的额外运行时包，装了才会出现在 get_available_providers() 里，
+# 没装就自然落到 CPU —— 所以同一份代码在两种机器上都能跑，不需要分支版本。
+_ACCEL = [
+    ("DmlExecutionProvider", "DirectML(GPU)"),     # onnxruntime-directml，任意 DX12 显卡
+    ("CUDAExecutionProvider", "CUDA(GPU)"),        # onnxruntime-gpu，NVIDIA
+    ("OpenVINOExecutionProvider", "OpenVINO"),     # onnxruntime-openvino，Intel 核显/NPU
+]
+
+
+def available_accel():
+    """列出当前 onnxruntime 真正注册了的加速后端。"""
+    have = set(ort.get_available_providers())
+    return [(ep, label) for ep, label in _ACCEL if ep in have]
+
+
+def _ep_session(model_path, intra_threads, eps):
+    """带加速后端的 session。CPU 永远排在最后兜底。"""
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    opts.intra_op_num_threads = intra_threads
+    opts.inter_op_num_threads = 1
+    providers = list(eps) + ["CPUExecutionProvider"]
+    return ort.InferenceSession(model_path, sess_options=opts, providers=providers)
+
+
 def _ov_compile(model_path, device, num_threads=4):
     """OpenVINO：首次自动转 IR 并缓存（同目录 .xml/.bin），之后秒加载。"""
     import openvino as ov
@@ -106,14 +133,38 @@ def _meta_sr(gen_path):
 class RvcPipeline:
     def __init__(self, gen_path, vec_path, rmvpe_path,
                  index_path="", index_rate=0.0,
-                 rms_mix_rate=0.25, protect=0.33, verbose=True):
+                 rms_mix_rate=0.40, protect=0.33, verbose=True, device="auto"):
         self.verbose = verbose
         self.profile = pick_profile()
         p = self.profile
+
+        # ---- 设备选择：auto / cpu / gpu ----
+        # auto：有加速后端就用，没有就 CPU（对用户零心智负担）
+        # cpu ：强制纯 CPU（怀疑显卡驱动有问题时用）
+        # gpu ：优先加速，但没有就退回 CPU 并明确告诉用户，绝不报错退出
+        accel = available_accel()
+        self.accel = accel
+        used = []
+        if device == "cpu" or not accel:
+            self._eps = []
+            self.device_used = "CPU"
+            if device == "gpu" and not accel:
+                self.device_used = "CPU（未安装 GPU 加速包，已自动退回）"
+        else:
+            self._eps = [ep for ep, _ in accel]
+            used = [label for _, label in accel]
+            self.device_used = " + ".join(used)
+        if self._eps:
+            p["engine"] = "onnxruntime-ep"      # 走加速后端，就不再走 OpenVINO 分支
+        elif device == "cpu":
+            p["engine"] = "onnxruntime-cpu"
+
         if verbose:
             print("[硬件] %s | 逻辑核 %d(估物理 %d) | profile=%s" %
                   (p["cpu"], p["logical"], p["physical"], p["profile"]))
-            if p["openvino"]:
+            print("[设备] %s%s" % (self.device_used,
+                                  "" if self._eps else "（纯 CPU 路径，功能完全一致）"))
+            if p.get("openvino") and not self._eps:
                 print("[硬件] OpenVINO 设备: %s" % p["ov_devices"])
 
         self.tgt_sr = _meta_sr(gen_path)
@@ -125,6 +176,10 @@ class RvcPipeline:
         self.t_query = SR16K * X_QUERY
         self.t_center = SR16K * X_CENTER
         self.t_max = SR16K * X_MAX
+        # 默认值对齐 docs/RECIPES.md：
+        #   protect 0.33→调用方传 0.10（唱歌），rms_mix_rate 0.25→0.40
+        #   rms_mix_rate 就是 volume_envelope 的实现：越大越跟随源音量包络。
+        #   0.4 = 主要跟源，1.0 = 完全听模型（句间会自我衰减，忽大忽小）。
         self.rms_mix_rate = rms_mix_rate
         self.protect = protect
         self.index = None
@@ -140,9 +195,9 @@ class RvcPipeline:
             self._gen_run = self._run_ov
         else:
             if verbose:
-                print("[加载] 生成器 → ORT CPU (intra=%d) : %s" %
-                      (p["intra_threads"], os.path.basename(gen_path)))
-            self.gen = _cpu_session(gen_path, p["intra_threads"])
+                print("[加载] 生成器 → %s (intra=%d) : %s" %
+                      (self.device_used, p["intra_threads"], os.path.basename(gen_path)))
+            self.gen = self._session(gen_path)
             self._gen_names = [i.name for i in self.gen.get_inputs()]
             self._gen_run = self._run_ort
 
@@ -156,8 +211,8 @@ class RvcPipeline:
             self._vec_run = self._run_ov
         else:
             if verbose:
-                print("[加载] ContentVec → ORT CPU")
-            self.vec = _cpu_session(vec_path, p["intra_threads"])
+                print("[加载] ContentVec → %s" % self.device_used)
+            self.vec = self._session(vec_path)
             self._vec_names = [i.name for i in self.vec.get_inputs()]
             self._vec_run = self._run_ort
 
@@ -171,11 +226,36 @@ class RvcPipeline:
             try:
                 import faiss
                 self.index = faiss.read_index(index_path)
+                # ★ 关键：IVF 索引默认没有 direct map，reconstruct_batch(id) 会报
+                #   "direct map not initialized"，检索就被静默跳过了（音色等于没拉）。
+                #   打开 direct map 之后才取得到向量。
+                try:
+                    if hasattr(self.index, "make_direct_map"):
+                        self.index.make_direct_map()
+                except Exception as e:
+                    print("[警告] make_direct_map 失败: %s" % e)
+                try:
+                    # nprobe 越小越准但越慢；RVC 官方用 1，这里给 8 兼顾
+                    self.index.nprobe = int(os.environ.get("RVC_NPROBE", "8"))
+                except Exception:
+                    pass
                 self.index_rate = index_rate
                 if verbose:
-                    print("[加载] 特征索引 %s" % index_path)
+                    print("[加载] 特征索引 %s（%d 条）" % (index_path, getattr(self.index, "ntotal", 0)))
             except Exception as e:
                 print("[警告] index 加载失败，跳过检索: %s" % e)
+
+    def _session(self, path):
+        """按当前设备建 session：有加速后端就用，否则纯 CPU。"""
+        if self._eps:
+            try:
+                return _ep_session(path, self.profile["intra_threads"], self._eps)
+            except Exception as e:
+                if self.verbose:
+                    print("[警告] %s 加载失败，退回 CPU: %s" % (self.device_used, str(e)[:80]))
+                self._eps = []
+                self.device_used = "CPU（加速后端加载失败，已退回）"
+        return _cpu_session(path, self.profile["intra_threads"])
 
     # ---- 运行时适配 ----
     @staticmethod
@@ -336,12 +416,23 @@ class RvcPipeline:
         return out * gain
 
     # ---- 主入口 ----
-    def convert_file(self, in_path, out_path, f0_up_key=0, sid=0):
+    def convert_file(self, in_path, out_path, f0_up_key=0, sid=0, on_progress=None):
         t0 = time.time()
+
+        def _p(frac, msg):
+            # 给图形界面用的进度回调；命令行不传就是 None，行为完全不变
+            if on_progress is not None:
+                try:
+                    on_progress(float(frac), str(msg))
+                except Exception:
+                    pass
+
+        _p(0.01, "读取音频…")
         audio, sr = sf.read(in_path, dtype="float32", always_2d=True)
         audio = audio.mean(1)
         if sr != SR16K:
             audio = soxr.resample(audio, sr, SR16K, quality="VHQ")
+        _p(0.05, "重采样到 16k（%.1f 秒音频）" % (len(audio) / SR16K))
 
         orig = audio
         audio = self._preprocess(audio)                        # 归一化 + 高通（不补边）
@@ -352,6 +443,7 @@ class RvcPipeline:
         # 每块再裁掉 t_pad，长度才对得上；缺这一步会把首尾真声裁掉。
         audio_pad = np.pad(audio, (self.t_pad, self.t_pad), mode="reflect")
         pitchf, pitch = self._extract_f0(audio_pad, f0_up_key)
+        _p(0.12, "音高提取完成，开始分块推理…")
 
         # 切点过滤：段太短或离结尾太近的切点直接丢弃（否则尾部会剩几十毫秒的碎片，
         # ContentVec 的 Conv 栈在超短输入上会直接报 Invalid input shape）
@@ -375,14 +467,21 @@ class RvcPipeline:
 
         results = []
         s = 0
-        for ta in cuts:
+        total_chunks = len(cuts) + 1
+        for ci, ta in enumerate(cuts):
             sw, ew = s // self.window, (ta + self.t_pad2) // self.window
+            _p(0.12 + 0.83 * ci / total_chunks,
+               "推理中：第 %d / %d 块" % (ci + 1, total_chunks))
             results.append(self._run_chunk(audio_pad[s: ta + self.t_pad2 + self.window],
                                            pitch[:, sw:ew], pitchf[:, sw:ew], sid))
             s = ta
         if s < len(audio_pad):
             sw = s // self.window
+            _p(0.12 + 0.83 * len(cuts) / total_chunks,
+               "推理中：第 %d / %d 块（末块）" % (total_chunks, total_chunks))
             results.append(self._run_chunk(audio_pad[s:], pitch[:, sw:], pitchf[:, sw:], sid))
+
+        _p(0.96, "拼接与音量对齐…")
 
         out = np.concatenate(results).astype(np.float32)
         out = self._change_rms(orig, out, self.rms_mix_rate)
@@ -395,6 +494,7 @@ class RvcPipeline:
         sf.write(out_path, out, self.tgt_sr, subtype="FLOAT")
         dur = len(out) / self.tgt_sr
         elapsed = time.time() - t0
+        _p(1.0, "完成：%.1f 秒音频，耗时 %.1f 秒（RTF %.2f）" % (dur, elapsed, elapsed / max(dur, 1e-6)))
         if self.verbose:
             print("[完成] %s | 音频 %.1fs | 耗时 %.1fs | RTF %.2f" %
                   (out_path, dur, elapsed, elapsed / dur))
