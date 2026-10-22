@@ -1,0 +1,6 @@
+{
+  "versionCode": 5,
+  "versionName": "0.5.0",
+  "url": "https://github.com/AmnioticF72072/rvc-cpu-lite/releases",
+  "notes": "通用版：不再分麒麟/天玑包，自动识别芯片选线程数；新增骁龙/三星/展锐识别"
+}
