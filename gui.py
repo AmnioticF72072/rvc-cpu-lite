@@ -46,6 +46,8 @@ _state = {
     "started_at": 0.0,
 }
 _pipe = None
+_pipe_device = None
+_abort = False
 _meta_cache = None
 
 
@@ -128,24 +130,34 @@ def meta():
     return _meta_cache
 
 
-def ensure_pipeline(index_rate=0.0):
-    global _pipe
-    if _pipe is not None:
+def ensure_pipeline(index_rate=0.0, device="auto"):
+    """模型只加载一次；但设备变了必须重建 session，否则切换不生效。"""
+    global _pipe, _pipe_device
+    if _pipe is not None and _pipe_device == device:
         _pipe.index_rate = float(index_rate)
         return _pipe
+    if _pipe is not None:
+        try:
+            _pipe = None
+            import gc
+            gc.collect()
+        except Exception:
+            pass
     gen, vec, rmv, idx = model_paths()
     missing = [n for n, p in (("生成器", gen), ("ContentVec", vec), ("RMVPE", rmv)) if not p]
     if missing:
         raise RuntimeError("models 目录里缺少模型文件：%s。请整个文件夹一起解压，"
                            "不要把 bat 单独拷出来。" % "、".join(missing))
     set_state(stage="loading", frac=0.02, msg="正在加载模型（第一次要 10~30 秒）…")
-    log("加载生成器：" + os.path.basename(gen))
+    log("加载模型，设备偏好：" + device)
     from rvc_cpu.infer import RvcPipeline
     _pipe = RvcPipeline(gen, vec, rmv, index_path=idx,
                         index_rate=float(index_rate) if idx else 0.0,
-                        protect=0.10, verbose=True)
-    set_state(model_ready=True)
-    log("模型就绪" + ("，特征索引：" + os.path.basename(idx) if idx else ""))
+                        protect=0.10, verbose=True, device=device)
+    _pipe_device = device
+    set_state(model_ready=True, device_used=getattr(_pipe, "device_used", "CPU"))
+    log("模型就绪｜设备：" + getattr(_pipe, "device_used", "CPU")
+        + ("｜特征索引：" + os.path.basename(idx) if idx else ""))
     return _pipe
 
 
@@ -180,53 +192,75 @@ def run_analyze(path):
         traceback.print_exc()
 
 
-def run_job(in_path, key, index_rate, sep_mode):
+def run_job(files, key, index_rate, sep_mode, device="auto"):
+    """批量转换：逐个文件走 分离 → 转换，总进度按文件数摊分。"""
+    global _abort
     try:
-        src = in_path
-        if sep_mode and sep_mode != "none":
-            from rvc_cpu import separate as sep
+        total = len(files)
+        outs = []
+        for i, in_path in enumerate(files):
+            if _abort:
+                raise RuntimeError("已取消")
+            # 每个文件占的进度区间
+            span = 1.0 / total
+            f0p = i * span
 
-            set_state(stage="separating", frac=0.02, phase="分离",
-                      msg="正在分离和声/伴奏（这一步比转换更吃 CPU）…")
-            log("开始分离，模式：" + sep_mode)
-            src = sep.run(sep_mode, in_path, os.path.join(WORK, "sep"),
-                          on_progress=lambda f, m: set_state(
-                              frac=0.02 + 0.38 * f, msg=m))
-            log("分离得到：" + os.path.basename(src))
+            def sub(frac, msg, _b=f0p, _s=span, _n=i + 1):
+                set_state(frac=round(_b + _s * float(frac), 4),
+                          msg=("[%d/%d] " % (_n, total)) + str(msg))
 
-        pipe = ensure_pipeline(index_rate)
+            src = in_path
+            if sep_mode and sep_mode != "none":
+                from rvc_cpu import separate as sep
 
-        def prog(frac, msg):
-            base = 0.42 if (sep_mode and sep_mode != "none") else 0.03
-            span = 0.96 - base
-            set_state(frac=round(base + span * float(frac), 4), msg=str(msg), phase="转换")
+                set_state(stage="separating", phase="分离",
+                          msg="正在分离和声/伴奏（这一步最慢，耐心等）…")
+                log("分离：%s（%s）" % (os.path.basename(in_path), sep_mode))
+                src = sep.run(sep_mode, in_path, os.path.join(WORK, "sep"),
+                              on_progress=lambda f, m, _sub=sub: _sub(0.05 + 0.4 * f, m))
+                log("分离得到：" + os.path.basename(src))
 
-        base = os.path.splitext(os.path.basename(in_path))[0]
-        base = re.sub(r"[\\/:*?\"<>|]", "_", base)[:60]
-        os.makedirs(OUT, exist_ok=True)
-        out_path = os.path.join(OUT, "%s_Plus.wav" % base)
-        n = 2
-        while os.path.isfile(out_path):
-            out_path = os.path.join(OUT, "%s_Plus(%d).wav" % (base, n))
-            n += 1
+            pipe = ensure_pipeline(index_rate, device)
 
-        set_state(stage="running", frac=0.05, msg="开始转换…", output="", error="",
-                  started_at=time.time(), phase="转换")
-        log("开始转换：%s（移调 %+d，检索 %.2f）" % (os.path.basename(src), int(key), index_rate))
-        pipe.convert_file(src, out_path, f0_up_key=int(key), on_progress=prog)
-        size = os.path.getsize(out_path) / 1024 ** 2
-        set_state(stage="done", frac=1.0, output=out_path, phase="",
-                  msg="完成 · %s（%.1f MB）" % (os.path.basename(out_path), size))
-        log("完成：" + out_path)
+            def prog(frac, msg, _sub=sub, _sep=(sep_mode and sep_mode != "none")):
+                if _abort:
+                    raise RuntimeError("已取消")
+                b = 0.5 if _sep else 0.05
+                _sub(b + (0.95 - b) * float(frac), msg)
+
+            base = os.path.splitext(os.path.basename(in_path))[0]
+            base = re.sub(r"[\\/:*?\"<>|]", "_", base)[:60]
+            os.makedirs(OUT, exist_ok=True)
+            out_path = os.path.join(OUT, "%s_Plus.wav" % base)
+            n = 2
+            while os.path.isfile(out_path):
+                out_path = os.path.join(OUT, "%s_Plus(%d).wav" % (base, n))
+                n += 1
+
+            set_state(stage="running", phase="转换", error="",
+                      started_at=time.time())
+            log("转换：%s（移调 %+d，检索 %.2f，设备 %s）" %
+                (os.path.basename(src), int(key), index_rate, device))
+            pipe.convert_file(src, out_path, f0_up_key=int(key), on_progress=prog)
+            outs.append(out_path)
+            log("完成：" + out_path)
+
+        last = outs[-1] if outs else ""
+        set_state(stage="done", frac=1.0, output=last, phase="", outputs=outs,
+                  msg="全部完成（%d 个文件）" % len(outs) if len(outs) > 1
+                  else "完成 · %s（%.1f MB）" % (os.path.basename(last),
+                                                 os.path.getsize(last) / 1024 ** 2))
     except Exception as e:
         m = str(e)
+        if "已取消" in m:
+            set_state(stage="idle", frac=0, phase="", msg="已取消（已完成的文件保留）")
+            log("任务已取消")
+            return
         hint = ""
         if "AVX" in m:
             hint = "（这台机器的 CPU 缺 AVX2，跑不了）"
         elif "Invalid input shape" in m:
             hint = "（音频太短，至少给 2 秒）"
-        elif "Karaoke" in m or "分离" in m:
-            hint = ""
         set_state(stage="error", error="%s%s" % (m, hint), msg="出错了")
         log("失败：" + m)
         traceback.print_exc()
@@ -386,7 +420,11 @@ PAGE = r"""<!doctype html>
           <span>第一次先用 10 秒左右的短音频试，确认能用再转整首</span>
         </div>
         <div class="file" id="filebox"><em id="fname">—</em></div>
-        <input type="file" id="picker" accept=".wav,.flac,.ogg,.aif,.aiff,audio/*" hidden>
+        <input type="file" id="picker" accept=".wav,.flac,.ogg,.aif,.aiff,audio/*" multiple hidden>
+        <div class="row" style="margin-top:8px">
+          <span id="qinfo" style="font-size:12.3px;color:#7a8899">还没选文件</span>
+          <button class="btn mini ghost" id="btnClear" style="display:none">清空</button>
+        </div>
       </div>
 
       <!-- 2 去和声 -->
@@ -441,6 +479,15 @@ PAGE = r"""<!doctype html>
       <div class="card">
         <div class="step"><div class="num">5</div><h2>开始</h2></div>
         <button class="btn" id="go" disabled>开始转换</button>
+        <div class="seg" id="segDev" style="margin-top:14px">
+          <label><input type="radio" name="dev" value="auto" checked><span>自动<small>有显卡就用</small></span></label>
+          <label><input type="radio" name="dev" value="cpu"><span>只用 CPU<small>最稳</small></span></label>
+          <label><input type="radio" name="dev" value="gpu"><span>用 GPU<small>需加速包</small></span></label>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn mini ghost" id="btnAbort">取消</button>
+          <span id="devInfo" style="font-size:12px;color:#7a8899;text-align:right"></span>
+        </div>
         <div class="prog">
           <div class="bar"><i id="bar"></i></div>
           <div class="pmsg"><span id="pmsg">选好文件后点上面按钮</span><span id="pct"></span></div>
@@ -448,6 +495,11 @@ PAGE = r"""<!doctype html>
         <div class="out" id="outbox">
           <b>转换好了</b>
           <code id="outpath"></code>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+            <button class="btn mini ghost" id="playIn">试听原声</button>
+            <button class="btn mini ghost" id="playOut">试听结果</button>
+          </div>
+          <audio id="player" controls style="width:100%;display:none"></audio>
           <button class="btn mini ghost" id="reveal">打开输出文件夹</button>
         </div>
         <div class="logbox" id="log" hidden></div>
@@ -537,7 +589,10 @@ async function loadMeta(){
 }
 
 $('#drop').onclick = () => $('#picker').click();
-$('#picker').onchange = e => { if(e.target.files[0]) upload(e.target.files[0]); };
+$('#picker').onchange = async e => {
+  for (const f of e.target.files) { await upload(f); }
+  e.target.value = '';
+};
 ['dragenter','dragover'].forEach(t=>$('#drop').addEventListener(t,e=>{
   e.preventDefault(); $('#drop').classList.add('over');}));
 ['dragleave','drop'].forEach(t=>$('#drop').addEventListener(t,e=>{
@@ -548,8 +603,13 @@ async function upload(file){
   setPicked(''); $('#pmsg').textContent = '正在读入文件…';
   const r = await fetch('/api/upload?name=' + encodeURIComponent(file.name), {method:'POST', body:file});
   const j = await r.json();
-  if(j.ok){ setPicked(j.name); $('#pmsg').textContent = '文件已读入，可以开始'; }
-  else { $('#pmsg').textContent = '读入失败：' + j.error; }
+  if(j.ok){
+    setPicked(j.name);
+    const n = j.count || 1;
+    $('#qinfo').textContent = n + ' 个文件已加入队列';
+    $('#btnClear').style.display = 'inline-flex';
+    $('#pmsg').textContent = '已读入，可以开始转换';
+  } else { $('#pmsg').textContent = '读入失败：' + j.error; }
 }
 
 function setKey(v, fromAuto){
@@ -580,11 +640,27 @@ $('#go').onclick = async () => {
   $('#bar').style.width='0%'; $('#pct').textContent='';
   const sep = (document.querySelector('input[name=sep]:checked')||{}).value || 'none';
   await fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({key:+$('#key').value, index_rate:+$('#idxrate').value/100, sep})});
+    body: JSON.stringify({key:+$('#key').value, index_rate:+$('#idxrate').value/100, sep,
+      device: (document.querySelector('input[name=dev]:checked')||{}).value || 'auto'})});
   poll();
 };
 
 $('#reveal').onclick = () => fetch('/api/reveal', {method:'POST'});
+$('#btnAbort').onclick = () => fetch('/api/abort', {method:'POST'});
+$('#btnClear').onclick = async () => {
+  await fetch('/api/clear', {method:'POST'});
+  setPicked(''); $('#qinfo').textContent = '还没选文件';
+  $('#btnClear').style.display = 'none'; $('#outbox').classList.remove('on');
+  $('#pmsg').textContent = '选好文件后点上面按钮';
+};
+function play(which){
+  const a = $('#player');
+  a.style.display = 'block';
+  a.src = '/api/audio?which=' + which + '&t=' + Date.now();
+  a.play().catch(()=>{});
+}
+$('#playIn').onclick = () => play('in');
+$('#playOut').onclick = () => play('out');
 
 async function poll(){
   clearTimeout(timer);
@@ -593,6 +669,11 @@ async function poll(){
   $('#bar').style.width = p+'%';
   $('#pct').textContent = p+'%';
   $('#pmsg').textContent = (s.phase ? '['+s.phase+'] ' : '') + (s.msg||'');
+  if(s.device_used) $('#devInfo').textContent = '实际设备：' + s.device_used;
+  if(s.queue && s.queue.length){
+    $('#qinfo').textContent = s.queue.length + ' 个文件已加入队列';
+    $('#btnClear').style.display = 'inline-flex';
+  }
 
   if(s.analysis){
     const a = s.analysis, st = a.stats;
@@ -658,6 +739,25 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         elif u.path == "/api/state":
             self._json(get_state())
+        elif u.path == "/api/audio":
+            q = parse_qs(u.query)
+            which = (q.get("which") or ["out"])[0]
+            idx = int((q.get("i") or ["0"])[0] or 0)
+            st = get_state()
+            if which == "in":
+                p = st.get("input") or ""
+            else:
+                outs = st.get("outputs") or ([st["output"]] if st.get("output") else [])
+                p = outs[idx] if 0 <= idx < len(outs) else (outs[-1] if outs else "")
+            if not p or not os.path.isfile(p):
+                return self._json({"ok": False, "error": "还没有可试听的文件"}, 404)
+            data = open(p, "rb").read()
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
         elif u.path == "/api/meta":
             try:
                 self._json(meta())
@@ -692,8 +792,11 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     f.write(buf)
                     left -= len(buf)
-            set_state(input=dst, output="", error="", analysis=None)
-            return self._json({"ok": True, "name": safe})
+            q = [x for x in (get_state().get("queue") or []) if os.path.isfile(x)]
+            q.append(dst)
+            set_state(input=dst, queue=q, output="", error="", analysis=None,
+                      outputs=[])
+            return self._json({"ok": True, "name": safe, "count": len(q)})
 
         body = self.rfile.read(n) if n else b"{}"
         try:
@@ -721,8 +824,25 @@ class Handler(BaseHTTPRequestHandler):
             key = int(payload.get("key", 0))
             rate = float(payload.get("index_rate", 0.0))
             sep_mode = str(payload.get("sep", "none"))
-            set_state(stage="loading", frac=0.01, msg="准备中…", error="", output="", phase="")
-            threading.Thread(target=run_job, args=(p, key, rate, sep_mode), daemon=True).start()
+            device = str(payload.get("device", "auto"))
+            global _abort
+            _abort = False
+            files = [x for x in (st.get("queue") or [p]) if os.path.isfile(x)]
+            if not files:
+                files = [p]
+            set_state(stage="loading", frac=0.01, msg="准备中…", error="", output="",
+                      outputs=[], phase="", total=len(files))
+            threading.Thread(target=run_job, args=(files, key, rate, sep_mode, device),
+                             daemon=True).start()
+            return self._json({"ok": True, "files": len(files)})
+
+        if u.path == "/api/abort":
+            _abort = True
+            log("收到取消请求，当前块跑完就停")
+            return self._json({"ok": True})
+
+        if u.path == "/api/clear":
+            set_state(queue=[], input="", analysis=None, outputs=[], output="")
             return self._json({"ok": True})
 
         if u.path == "/api/reveal":
