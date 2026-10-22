@@ -11,6 +11,35 @@ estimate, I have not tested that CPU.
 
 Inference only. No training, no realtime, no source separation.
 
+## Minimum hardware
+
+An 8th-gen i5 office laptop with 8 GB of RAM and no dGPU is enough.
+
+| | Requirement | Note |
+|---|---|---|
+| CPU | x64, 4 cores minimum, 6 preferred | Needs AVX2. Intel Haswell (2013) and AMD Zen (2017) onward are fine; old Celeron / Atom chips will fail to start |
+| RAM | 8 GB works, 16 GB comfortable | Peak 2–3 GB: 830 MB of weights plus activations and resampling buffers |
+| GPU | not needed, not even the iGPU | CPU path only |
+| Disk | 1.2 GB free | ~1 GB for the three models, the rest for output (a 4-minute 48 kHz wav is about 40 MB) |
+| OS | Windows 10/11 x64, tested | Source mode should work on Linux/macOS, untested |
+
+RAM is the real constraint. Close games and browsers while converting; once the machine starts
+paging, wall clock doubles or worse.
+
+At RTF 1.51 a full song takes roughly:
+
+| Length | 6-core i5 | 12th-gen i5 |
+|---|---|---|
+| 3 min | 4.5 min | 3 min |
+| 4 min | 6 min | 4 min |
+| 5 min | 7.5 min | 5 min |
+
+RTF is essentially linear, longer files do not degrade further.
+
+Training is out of the question on this class of machine: RVC v2 at 200 epochs on 10–15 minutes
+of audio takes 2–4 hours on a 3060 and 50–100× that on a CPU, with memory it does not have.
+Train once on a GPU, export to ONNX, then this laptop only does inference.
+
 ## Usage
 
 ```bash
