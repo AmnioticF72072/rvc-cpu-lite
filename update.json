@@ -1,6 +1,7 @@
 {
-  "versionCode": 7,
-  "versionName": "0.6.0",
-  "url": "https://github.com/AmnioticF72072/rvc-cpu-lite/releases",
-  "notes": "修复转换必崩：RMVPE 帧数补齐到 32 倍数；末块补齐到 1024 帧；f0 与音频网格对齐"
+  "versionCode": 8,
+  "versionName": "0.7.0",
+  "liteUrl": "https://github.com/AmnioticF72072/rvc-cpu-lite/releases/download/v0.7.0/RVC-CPU-v0.7-lite.apk",
+  "url": "https://github.com/AmnioticF72072/rvc-cpu-lite/releases/download/v0.7.0/RVC-CPU-v0.7-lite.apk",
+  "notes": "更新包只要 22MB：模型不再打包进更新包，直接复用手机上已解包的那份。下载支持多镜像自动切换 + 断点续传 + 实时速度。"
 }
