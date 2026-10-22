@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+models/*.onnx
+models/*.json
+输出/
+output/
+*.wav
+*.mp3
+*.flac
+!docs/**/*.wav
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.log
