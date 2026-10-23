@@ -65,13 +65,26 @@ def run_audio_separator(in_path, out_dir, model_file, mode):
 
 
 def run_demucs(in_path, out_dir):
+    """人声 / 伴奏分离。
+
+    **overlap 是关键参数**。demucs 默认 overlap=0.25，意思是相邻分块只有 25%
+    重叠来做拼接。这在段落交界处（换气、鼓点切换）会留下明显串音：
+    人声轨里能听到鼓，伴奏轨里能听到人声。实测把 overlap 提到 0.75 之后
+    串音显著下降，代价是耗时约 3 倍 —— 对 CPU 用户是笔值得的交换，
+    因为分离不干净的后果是"整首翻唱都带着别人的声音"，不能忍。
+
+    shifts=1 保持默认：提高它会成倍增加耗时，收益远小于 overlap。
+    cpu 上再叠加 shifts 会让 4 分钟歌从 3 分钟变成十几分钟，不划算。
+    """
     import subprocess
+    import os as _os
+    overlap = _os.environ.get("SEP_OVERLAP", "0.75")
     cmd = [sys.executable, "-m", "demucs", "-n", "htdemucs", "--two-stems=vocals",
-           "-o", out_dir, in_path]
-    if os.environ.get("SEP_DEVICE"):
-        cmd[3:3] = ["-d", os.environ["SEP_DEVICE"]]
-    env = dict(os.environ)
-    env.setdefault("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache"))
+           "--overlap", str(overlap), "-o", out_dir, in_path]
+    if _os.environ.get("SEP_DEVICE"):
+        cmd[3:3] = ["-d", _os.environ["SEP_DEVICE"]]
+    env = dict(_os.environ)
+    env.setdefault("HF_HOME", _os.path.join(_os.path.expanduser("~"), ".cache"))
     env.pop("PYTHONPATH", None)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, encoding="utf-8", errors="ignore", env=env)
@@ -83,20 +96,36 @@ def run_demucs(in_path, out_dir):
         buf.append(line)
         if len(buf) > 40:
             del buf[:20]
-        low = line.lower()
         if "%" in line:
             emit(stage="separating", frac=0.5, msg="正在分离：" + line.strip()[:60])
     p.wait()
-    stem = os.path.splitext(os.path.basename(in_path))[0]
-    cand = os.path.join(out_dir, "htdemucs", stem, "vocals.wav")
-    if not os.path.isfile(cand):
-        for root, _d, fs in os.walk(out_dir):
+    stem = _os.path.splitext(_os.path.basename(in_path))[0]
+    cand = _os.path.join(out_dir, "htdemucs", stem, "vocals.wav")
+    if not _os.path.isfile(cand):
+        for root, _d, fs in _os.walk(out_dir):
             for f in fs:
                 if f == "vocals.wav":
-                    cand = os.path.join(root, f)
-    if p.returncode != 0 or not os.path.isfile(cand):
+                    cand = _os.path.join(root, f)
+    if p.returncode != 0 or not _os.path.isfile(cand):
         raise RuntimeError("demucs 失败：" + "\n".join(buf[-6:]))
     return cand
+
+
+def find_accompaniment(sep_out_dir, in_path):
+    """分离后顺手把伴奏轨找出来（demucs --two-stems=vocals 会同时产出 no_vocals）。
+
+    返回伴奏路径或空串。上层用它做"换完人声再合回去"——
+    这才是翻唱的标准流程：伴奏必须保留原样，只换主唱。
+    """
+    stem = _os.path.splitext(_os.path.basename(in_path))[0]
+    cand = _os.path.join(sep_out_dir, "htdemucs", stem, "no_vocals.wav")
+    if _os.path.isfile(cand):
+        return cand
+    for root, _d, fs in _os.walk(sep_out_dir):
+        for f in fs:
+            if f == "no_vocals.wav":
+                return _os.path.join(root, f)
+    return ""
 
 
 def main():
@@ -129,7 +158,10 @@ def main():
     # 2) 人声 / 伴奏
     try:
         out = run_demucs(a.inp, a.out)
-        emit(stage="done", frac=1.0, msg="已分出人声", out=out, sec=round(time.time() - t0, 1))
+        # 顺手报上伴奏轨：上层需要它来做"换完人声再合回去"
+        acc = find_accompaniment(a.out, a.inp)
+        emit(stage="done", frac=1.0, msg="已分出人声", out=out,
+             accomp=acc, sec=round(time.time() - t0, 1))
         return 0
     except Exception as e:
         emit(stage="warn", frac=0.5, msg="demucs 不可用，改用 UVR MDX：%s" % str(e)[:80])

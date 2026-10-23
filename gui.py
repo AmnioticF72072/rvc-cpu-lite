@@ -51,6 +51,14 @@ def invalidate():                                              # noqa: F811
 
 
 # ---------------------------------------------------------------- 资源发现
+def _has_torch():
+    try:
+        from rvc_cpu import models as mm
+        return bool(mm.find_torch_python())
+    except Exception:
+        return False
+
+
 def _has_faiss():
     try:
         from rvc_cpu import has_index_backend
@@ -90,6 +98,8 @@ def meta():
         # 特征检索后端（faiss）是否可用 —— 这个不做的话 index_rate 完全无效，
         # 而 index 正是决定"像不像目标角色"的头号因素，必须让用户看见
         "index_backend": _has_faiss(),
+        # .pth 导入需要 torch；没有的话界面要提前说，而不是等用户点了才失败
+        "torch_backend": bool(_has_torch()),
         "model_list": models,
         "models": {
             "gen": os.path.basename(gen) if gen else "",
@@ -202,8 +212,31 @@ def run_job(files, key, index_rate, sep_mode, device="auto"):
                 log("转换：%s（移调 %+d，检索 %.2f，设备 %s）" %
                     (os.path.basename(src), int(key), index_rate, device))
                 pipe.convert_file(src, out_path, f0_up_key=int(key), on_progress=prog)
+                log("完成人声：" + os.path.basename(out_path))
+
+                # 分人声模式下，把换好的人声和原伴奏合回去 ——
+                # 这才是翻唱：伴奏保留原样，只换主唱。
+                # v2.0.x 之前只输出人声、把伴奏丢了，听起来就是"伴奏没了"。
+                if sep_mode == "vocals":
+                    acc = getattr(sep, "LAST_ACCOMP", "") if sep else ""
+                    if acc and os.path.isfile(acc):
+                        try:
+                            from rvc_cpu.mixdown import mix
+                            set_state(msg="正在和原伴奏合轨…", frac=0.97)
+                            mixed = out_path[:-4] + "_混音.wav"
+                            _, mst = mix(out_path, acc, mixed)
+                            log("合轨完成：%s（人声 %.1f dB / 伴奏 %.1f dB，峰值 %.2f）"
+                                % (os.path.basename(mixed), mst["vocal_rms_db"],
+                                   mst["acc_rms_db"], mst["peak"]))
+                            out_path = mixed
+                        except Exception as me:
+                            log("合轨失败（人声已单独保存）：%s" % me)
+                    else:
+                        log("没找到伴奏轨，只输出人声。"
+                            "（伴奏由 demucs 产出；若这台机器没有 demucs 就没有伴奏可合）")
+
                 outs.append(out_path)
-                log("完成：" + out_path)
+                log("输出：" + os.path.basename(out_path))
 
                 # 质量自检：单文件必跑；批量只跑最后一个（全跑要多等一分多钟）
                 if total == 1 or i == total - 1:
@@ -549,10 +582,13 @@ PAGE = r"""<!doctype html>
           <span class="opt">可导入别人的模型</span></div>
         <p class="hint">当前用的是「<b id="curModel">—</b>」。可以导入其他人分享的 RVC 模型：
           拖入 <b>.pth</b>（本机有 PyTorch 就自动转换）或 <b>.onnx</b> 都行，
-          有配套 .index 一起放，音色会更像。</p>
+          有配套 .index 一起放，音色会更像。<br>
+          <span style="color:#9aa8ba">也可以直接把 <b>.onnx</b> 拷进程序目录的 <b>models</b>
+          文件夹，然后点「刷新列表」——这一步不需要转换，最省事。</span></p>
         <div class="seg" id="segModel"></div>
         <div class="row" style="margin-top:10px;gap:10px">
           <button class="btn mini ghost" id="btnImport">导入模型…</button>
+          <button class="btn mini ghost" id="btnRefreshModel">刷新列表</button>
           <button class="btn mini ghost" id="btnDelModel">删除这个</button>
           <span id="modelInfo" style="font-size:12px;color:#7a8899;text-align:right;flex:1"></span>
         </div>
@@ -959,6 +995,20 @@ $('#modelPicker').onchange = async e => {
   await fetch('/api/model/import', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({name: base})});
   poll();
+};
+
+$('#btnRefreshModel').onclick = async () => {
+  $('#pmsg').textContent = '正在刷新模型列表…';
+  const j = await (await fetch('/api/model/refresh', {method:'POST'})).json();
+  if (j.ok){
+    meta = await (await fetch('/api/meta')).json();
+    if (meta.index_backend !== undefined) _hasIdxBackend = (meta.index_backend !== false);
+    renderModels(meta);
+    $('#pmsg').textContent = '已刷新：' + j.count + ' 个模型（当前「' + (j.active || '无') + '」）'
+      + (j.torch ? '｜.pth 可导入' : '｜无 PyTorch，只能用 .onnx');
+  } else {
+    $('#pmsg').textContent = '刷新失败：' + j.error;
+  }
 };
 
 $('#btnDelModel').onclick = async () => {
@@ -1609,6 +1659,30 @@ class Handler(BaseHTTPRequestHandler):
             if st["stage"] in ("running", "loading", "separating", "analyzing", "importing"):
                 return self._json({"ok": False, "error": "正在忙，等一下"})
             key = int(payload.get("key", 0))
+            # 没做过音高分析就直接转换，是最常见的"声音发闷、咬字不清"来源：
+            # 移调停在 0，输出音高会掉到模型舒适区之外。这里在转换前
+            # 自动跑一次分析并采用建议值（用户手动设过就不动）。
+            if not payload.get("key_locked") and not st.get("analysis"):
+                try:
+                    from rvc_cpu.calibrate import analyze_file, load_profile, suggest
+                    from rvc_cpu import models as _mm
+                    rmv = os.path.join(MODELS, "rmvpe.onnx")
+                    if os.path.isfile(rmv):
+                        set_state(stage="analyzing", frac=0.01,
+                                  msg="先测一下音高，避免移调错了白跑…")
+                        stats, f0 = analyze_file(rmv, p, return_f0=True)
+                        prof = None
+                        try:
+                            prof = load_profile(MODELS, _mm.active_name())
+                        except Exception:
+                            prof = None
+                        r = suggest(stats, prof)
+                        key = int(r["key"])
+                        set_state(analysis={"stats": stats, "key": key,
+                                            "reason": r["reason"], "auto": True})
+                        log("自动定调：移 %+d 半音（%s）" % (key, r["reason"]))
+                except Exception as _e:
+                    log("自动定调跳过（%s），按原移调 %+d 继续" % (str(_e)[:60], key))
             rate = float(payload.get("index_rate", 0.0))
             sep_mode = str(payload.get("sep", "none"))
             device = str(payload.get("device", "auto"))
@@ -1719,6 +1793,23 @@ class Handler(BaseHTTPRequestHandler):
                       error="", imported="")
             threading.Thread(target=run_import, args=(nm,), daemon=True).start()
             return self._json({"ok": True})
+
+        if u.path == "/api/model/refresh":
+            # 强制丢掉 meta 缓存：用户可能自己把 .onnx 拷进了 models 目录，
+            # 不走导入流程也想让它出现（这是最省事的用法，得支持）
+            global _meta_cache, _meta_cache_at
+            _meta_cache = None
+            _meta_cache_at = 0.0
+            try:
+                from rvc_cpu import models as _mm
+                lst, act = _mm.list_models()
+                hint = _mm.torch_hint()
+                log("刷新模型列表：%d 个（当前 %s）" % (len(lst), act or "无"))
+                return self._json({"ok": True, "count": len(lst), "active": act,
+                                   "torch": bool(_mm.find_torch_python()),
+                                   "torch_hint": hint})
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)})
 
         if u.path == "/api/model/select":
             # 参数优先取 JSON body，其次取 query（两种写法都接受，方便脚本调用）

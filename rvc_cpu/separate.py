@@ -64,8 +64,18 @@ def probe():
     return info
 
 
+LAST_ACCOMP = ""      # 最近一次分离产出的伴奏轨（vocals 模式才有）
+
+
 def run(mode, in_path, out_dir, on_progress=None, model=""):
-    """跑分离。mode: karaoke | vocals。返回人声文件路径。"""
+    """跑分离。mode: karaoke | vocals。返回人声文件路径。
+
+    vocals 模式会把伴奏轨记在模块变量 LAST_ACCOMP —— 上层用它做合轨。
+    用模块变量而不是改返回值，是为了不破坏现有调用方（run 的返回值
+    一直是"人声路径"，很多地方按这个约定在用）。
+    """
+    global LAST_ACCOMP
+    LAST_ACCOMP = ""
     info = probe()
     py = info["python"]
     if not py:
@@ -112,6 +122,9 @@ def run(mode, in_path, out_dir, on_progress=None, model=""):
             err = d.get("msg", "分离失败")
         elif stage == "done":
             out_path = d.get("out", "")
+            acc = d.get("accomp") or ""
+            if acc and os.path.isfile(acc):
+                LAST_ACCOMP = acc
             emit(0.98, d.get("msg", "分离完成"))
         elif stage == "warn":
             emit(0.5, d.get("msg", ""))

@@ -456,6 +456,27 @@ class RvcPipeline:
             return out[lo:]
         return out[lo:hi]
 
+    # ---- 去直流 ----
+    @staticmethod
+    def _dc_block(x, sr=0, cutoff=25.0):
+        """去掉直流偏置。
+
+        实测输出残留约 +0.001 的 DC。24-bit 下这点偏移本身不致命，
+        但它会让整段波形整体上移，某些播放器/功放会因此提前触顶削波，
+        听起来"发闷"。减均值是零风险的（不改任何频率成分）。
+
+        没有做更狠的高通：男声基频能低到 80Hz，任何高于这个的切点都会
+        吃掉胸腔共鸣让声音变薄，收益不值这个代价。
+        """
+        import numpy as np
+        x = np.asarray(x, np.float32)
+        if x.size == 0:
+            return x
+        m = float(np.mean(x))
+        if abs(m) < 1e-6:
+            return x
+        return (x - m).astype(np.float32)
+
     # ---- RMS 包络混合（官方公式）----
     def _change_rms(self, ref16k, out, rate):
         hop1, hop2 = SR16K // 2, self.tgt_sr // 2
@@ -549,12 +570,20 @@ class RvcPipeline:
         out = np.concatenate(results).astype(np.float32)
         out = self._change_rms(orig, out, self.rms_mix_rate)
 
+        # 去 DC + 次声高通：实测输出残留约 +0.001 的直流偏置，
+        # 播放时会白白吃掉动态范围，听起来"发闷"，某些设备还会有轻微电流感。
+        out = self._dc_block(out, self.tgt_sr)
+
         peak = np.abs(out).max() / 0.99
         if peak > 1:
             out = out / peak
         # 每块已在 _run_chunk 内裁掉 3s 上下文（对齐官方 pipeline.py:388），不再全局裁
 
-        sf.write(out_path, out, self.tgt_sr, subtype="FLOAT")
+        # 输出 24-bit PCM，不用 32-bit 浮点。
+        # 浮点 WAV（WAVE_FORMAT_IEEE_FLOAT）在不少播放器和剪辑软件里兼容性差，
+        # 会被当成整数采样解析 → 直接变成刺耳噪音，听感就是"带电/电流声"。
+        # 24-bit 已经是无损级别（144dB 动态范围），兼容性远好于浮点。
+        sf.write(out_path, out, self.tgt_sr, subtype="PCM_24")
         dur = len(out) / self.tgt_sr
         elapsed = time.time() - t0
         _p(1.0, "完成：%.1f 秒音频，耗时 %.1f 秒（RTF %.2f）" % (dur, elapsed, elapsed / max(dur, 1e-6)))

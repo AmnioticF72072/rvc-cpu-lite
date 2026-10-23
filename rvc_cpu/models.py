@@ -225,19 +225,39 @@ def _has_module(py, mod):
 
 
 def find_torch_python():
-    """找一个装了 torch 的 python（转换 .pth 用）。找不到返回空串。"""
+    """找一个装了 torch 的 python（转换 .pth 用）。找不到返回空串。
+
+    为什么要找这么多地方：用户导入的角色模型绝大多数是 `.pth`，转 ONNX
+    必须有 torch。原先只认三个硬编码路径，换台机器就找不到 ——
+    表现是"导入失败"，用户完全不知道该装什么。
+
+    注意：**打包版自带的 runtime 里没有 torch**（torch 有 2GB+，
+    为了体积不内置）。所以这里是在"借"用户机器上已有的 Python 环境。
+    """
     cands = [
         os.path.join(ROOT, ".venv", "Scripts", "python.exe"),
         os.path.join(ROOT, "..", "env", "rvc", "Scripts", "python.exe"),
-        r"G:\AIVoice\env\rvc\Scripts\python.exe",
     ]
+    # 常见的本机 Python（打包/训练工具链留下的）
+    for base in (r"G:\AIVoice\env", os.path.expanduser(r"~\AppData\Local\Programs")):
+        try:
+            if os.path.isdir(base):
+                for name in sorted(os.listdir(base)):
+                    p = os.path.join(base, name, "Scripts", "python.exe")
+                    if os.path.isfile(p):
+                        cands.append(p)
+        except OSError:
+            pass
+    # 系统 PATH 里的 python / python3
     try:
         import shutil
-        w = shutil.which("python")
-        if w:
-            cands.insert(0, w)
+        for exe in ("python", "python3", "py"):
+            w = shutil.which(exe)
+            if w:
+                cands.insert(0, w)
     except Exception:
         pass
+
     seen = set()
     for py in cands:
         if not py or py.lower() in seen:
@@ -246,6 +266,20 @@ def find_torch_python():
         if os.path.isfile(py) and _has_module(py, "torch"):
             return py
     return ""
+
+
+def torch_hint():
+    """给界面用的：找不到 torch 时该告诉用户什么。"""
+    if find_torch_python():
+        return ""
+    return ("这台电脑上没有找到装 PyTorch 的 Python，所以无法把 .pth 转成 ONNX。\n\n"
+            "三个办法（挑一个）：\n"
+            "① 找找分享包里有没有同名的 .onnx 文件 —— 很多模型两种格式都提供，"
+            "直接导入 .onnx 不用转换，速度也快。\n"
+            "② 装一个 PyTorch：pip install torch "
+            "--index-url https://download.pytorch.org/whl/cpu\n"
+            "   装完重启本程序，再导入 .pth。\n"
+            "③ 在别的有 torch 的电脑上转好 .onnx 再拿过来。")
 
 
 # 导入的 .pth 统一按 T=1024 导出（与内置模型一致、经过完整验证）。
