@@ -15,11 +15,11 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKER = os.path.join(ROOT, "tools", "sep_worker.py")
 
-# 可能装了 torch 的 python，按优先级
+# 可能装了 torch 的 python，按优先级（都相对仓库位置，不写死作者本机路径）
 PY_CANDIDATES = [
     os.path.join(ROOT, ".venv", "Scripts", "python.exe"),
     os.path.join(ROOT, "..", "env", "rvc", "Scripts", "python.exe"),
-    r"G:\AIVoice\env\rvc\Scripts\python.exe",
+    os.path.join(ROOT, "..", "..", "env", "rvc", "Scripts", "python.exe"),
 ]
 
 
