@@ -28,74 +28,27 @@ OUT = os.path.join(ROOT, "输出")
 MODELS = os.path.join(ROOT, "models")
 MODEL_STAGE = os.path.join(WORK, "_导入暂存")
 PORT = int(os.environ.get("RVC_GUI_PORT", "8790"))
-VERSION = "Plus 1.3"
-
 sys.path.insert(0, ROOT)
 
-_lock = threading.Lock()
-_pipe_lock = threading.Lock()   # 保护管线重建（避免并发各建一份）
-_state = {
-    "stage": "idle",          # idle | analyzing | separating | loading | running | importing | done | error
-    "frac": 0.0,
-    "msg": "准备好了",
-    "phase": "",
-    "input": "",
-    "output": "",
-    "error": "",
-    "log": [],
-    "model_ready": False,
-    "analysis": None,
-    "qa": None,               # 转换后的质量自检结果
-    "started_at": 0.0,
-    "imported": "",
-}
-_pipe = None
-_pipe_device = None
+# v2.0：状态与管线生命周期移到 app/core.py。
+# 这里保留同名引用，是为了让原有路由/任务代码一行都不用改（零回归迁移）。
+from app import core as _core                                  # noqa: E402
+from app.core import (VERSION, ensure_pipeline, get_state, log,      # noqa: E402,F401
+                      model_paths, set_state)
+
+_lock = _core._lock
 _abort = False
-_meta_cache = None
+_meta_cache = None      # gui 自己的 meta 缓存（字段名与 app.core 不同，不能共用）
 
 
-def log(line):
-    with _lock:
-        _state["log"].append("%s  %s" % (time.strftime("%H:%M:%S"), line))
-        if len(_state["log"]) > 240:
-            del _state["log"][:100]
-    print(line, flush=True)
-
-
-def set_state(**kw):
-    with _lock:
-        _state.update(kw)
-
-
-def get_state():
-    with _lock:
-        d = dict(_state)
-        d["log"] = list(_state["log"])
-        return d
+def invalidate():                                              # noqa: F811
+    """兼容旧调用点：模型变了要同时丢掉管线与音高分析。"""
+    global _meta_cache
+    _meta_cache = None
+    _core.invalidate()
 
 
 # ---------------------------------------------------------------- 资源发现
-def model_paths():
-    """当前激活模型的 (生成器, ContentVec, RMVPE, 索引)。"""
-    from rvc_cpu import models as mm
-    p = mm.paths_for()
-    return p["gen"], p["vec"], p["rmv"], p["idx"]
-
-
-def invalidate():
-    """模型切换 / 导入 / 删除后调用：丢掉已加载流水线与元数据缓存。
-
-    同时作废已有的音高分析结果 —— 那个建议是拿"旧模型的音域画像"算出来的，
-    换了模型就失效了，留在界面上会误导人。
-    """
-    global _pipe, _pipe_device, _meta_cache
-    _pipe = None
-    _pipe_device = None
-    _meta_cache = None
-    set_state(analysis=None)
-
-
 def meta():
     """给界面用的资源清单（缓存一次，避免每次轮询都扫盘）。"""
     global _meta_cache
@@ -136,46 +89,6 @@ def meta():
         },
     }
     return _meta_cache
-
-
-def ensure_pipeline(index_rate=0.0, device="auto"):
-    """模型只加载一次；但设备变了必须重建 session，否则切换不生效。
-
-    用 _pipe_lock 保护重建路径：管线常驻约 1 GB，两个请求同时进来
-    各建一份，16G 机器直接贴着上限，很容易触发换页甚至 OOM。
-    """
-    global _pipe, _pipe_device
-    if _pipe is not None and _pipe_device == device:
-        _pipe.index_rate = float(index_rate)
-        return _pipe
-    with _pipe_lock:
-        # 等锁期间可能已经被别的线程建好了
-        if _pipe is not None and _pipe_device == device:
-            _pipe.index_rate = float(index_rate)
-            return _pipe
-        if _pipe is not None:
-            try:
-                _pipe = None
-                import gc
-                gc.collect()
-            except Exception:
-                pass
-        gen, vec, rmv, idx = model_paths()
-        missing = [n for n, p in (("生成器", gen), ("ContentVec", vec), ("RMVPE", rmv)) if not p]
-        if missing:
-            raise RuntimeError("models 目录里缺少模型文件：%s。请整个文件夹一起解压，"
-                               "不要把 bat 单独拷出来。" % "、".join(missing))
-        set_state(stage="loading", frac=0.02, msg="正在加载模型（第一次要 10~30 秒）…")
-        log("加载模型，设备偏好：" + device)
-        from rvc_cpu.infer import RvcPipeline
-        _pipe = RvcPipeline(gen, vec, rmv, index_path=idx,
-                            index_rate=float(index_rate) if idx else 0.0,
-                            protect=0.10, verbose=True, device=device)
-        _pipe_device = device
-        set_state(model_ready=True, device_used=getattr(_pipe, "device_used", "CPU"))
-        log("模型就绪｜设备：" + getattr(_pipe, "device_used", "CPU")
-            + ("｜特征索引：" + os.path.basename(idx) if idx else ""))
-    return _pipe
 
 
 # ---------------------------------------------------------------- 任务
@@ -528,7 +441,42 @@ PAGE = r"""<!doctype html>
   .warn{font-size:12px;color:#9a6b00;background:rgba(255,190,0,.1);border:1px solid rgba(255,190,0,.22);
     padding:8px 11px;border-radius:12px;margin-top:10px;display:none}
   .warn.on{display:block}
-  /* ---------- v1.3 视觉精修（只调整观感，不改结构） ---------- */
+  /* ---------- v2.0 双模式与朗读面板 ---------- */
+  .modes{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0 14px}
+  .mode{display:flex;flex-direction:column;gap:3px;align-items:flex-start;
+    padding:15px 18px;border-radius:18px;cursor:pointer;text-align:left;
+    background:rgba(255,255,255,.62);border:1px solid rgba(255,255,255,.9);
+    box-shadow:0 8px 22px -14px rgba(20,40,80,.28);
+    backdrop-filter:blur(18px);transition:.2s}
+  .mode b{font-size:15.5px;color:#0e2a4d;font-weight:700}
+  .mode span{font-size:12px;color:#7a8899}
+  .mode:hover{background:rgba(255,255,255,.82);transform:translateY(-1px)}
+  .mode.on{background:linear-gradient(180deg,#2b93ff,#0a84ff);
+    border-color:transparent;box-shadow:0 12px 28px -10px rgba(10,132,255,.55)}
+  .mode.on b{color:#fff}
+  .mode.on span{color:rgba(255,255,255,.82)}
+
+  .rdtext{width:100%;padding:14px 15px;border-radius:14px;resize:vertical;
+    font-family:inherit;font-size:14.5px;line-height:1.75;color:#0e2a4d;
+    background:rgba(255,255,255,.85);border:1px solid rgba(10,132,255,.18);
+    outline:none;transition:.18s;min-height:120px}
+  .rdtext:focus{border-color:#0a84ff;background:#fff;
+    box-shadow:0 0 0 3px rgba(10,132,255,.1)}
+  .rdtext::placeholder{color:#a9b6c6}
+
+  .rdselect{width:100%;padding:11px 13px;border-radius:12px;font-size:14px;
+    font-family:inherit;color:#0e2a4d;background:rgba(255,255,255,.9);
+    border:1px solid rgba(10,132,255,.18);outline:none;cursor:pointer}
+  .rdselect:focus{border-color:#0a84ff}
+
+  .rdauto{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;
+    color:#41526b;cursor:pointer;user-select:none}
+  .rdauto input{width:15px;height:15px;accent-color:#0a84ff;cursor:pointer}
+
+  /* 情绪九宫格 */
+  #segEmo{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+  #segEmo label{margin:0}
+  #segEmo label span{font-size:13px;padding:9px 4px}
   /* 流程卡左侧竖条：一眼看出这是第几步 */
   .card{position:relative}
   .card:has(.step)::before{content:"";position:absolute;left:0;top:20px;bottom:20px;
@@ -564,7 +512,17 @@ PAGE = r"""<!doctype html>
     <div class="badge" id="badge">正在读取模型…</div>
   </div>
 
-  <div class="grid">
+  <!-- v2.0 双模式：翻唱用现成音频，朗读从文字开始 -->
+  <div class="modes" id="modes">
+    <button class="mode on" data-m="sing">
+      <b>翻唱 / 变声</b><span>已有音频，换成目标音色</span>
+    </button>
+    <button class="mode" data-m="read">
+      <b>朗读（文字）</b><span>打一段字，直接念出来</span>
+    </button>
+  </div>
+
+  <div class="grid" id="gridSing">
     <div>
       <!-- 0 音色模型 -->
       <div class="card">
@@ -728,6 +686,103 @@ PAGE = r"""<!doctype html>
         <details><summary>这一步会联网吗？</summary>
           <p>不会。界面是本机网页（127.0.0.1），音频不上传。
              唯一可能联网的是第一次用「去和声」时下载 Karaoke 模型。</p></details>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ v2.0 朗读面板（模式切到「朗读」时显示）============ -->
+  <div class="grid" id="gridRead" style="display:none">
+    <div>
+      <div class="card">
+        <div class="step"><div class="num">1</div><h2>要念的文字</h2>
+          <span class="opt">打字就行，不用录音</span></div>
+        <p class="hint">按句自动切分，句号/问号/感叹号都算一句。单次上限 5000 字。</p>
+        <textarea id="rdText" class="rdtext" rows="7"
+          placeholder="在这里打一段话，比如：&#10;大家好，我是用这个声音模型说话的。&#10;现在你听到的每一个字，都是从文字直接生成的。"></textarea>
+        <div class="row" style="margin-top:8px">
+          <span id="rdCount" style="font-size:12.3px;color:#7a8899">0 字</span>
+          <span id="rdEst" style="font-size:12.3px;color:#9aa8ba"></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="step"><div class="num">2</div><h2>念成什么情绪</h2>
+          <span class="opt">影响语调，不影响音色</span></div>
+        <p class="hint">情绪作用在「念」的语调上，之后会换成你选的音色。音色本身由第 4 步决定。</p>
+        <div class="seg" id="segEmo"></div>
+      </div>
+
+      <div class="card">
+        <div class="step"><div class="num">3</div><h2>载体声音</h2>
+          <span class="opt">只决定节奏与语调</span></div>
+        <p class="hint">这一层的声音最后会被替换掉。选同性别的载体，语调更自然。</p>
+        <select id="rdVoice" class="rdselect"></select>
+        <div class="row" style="margin-top:10px">
+          <button class="btn mini ghost" id="rdPreview">试听语调（不变声）</button>
+          <span id="rdPrevMsg" style="font-size:12px;color:#7a8899;text-align:right"></span>
+        </div>
+        <audio id="rdPlayer" controls style="width:100%;display:none;margin-top:8px"></audio>
+      </div>
+
+      <div class="card">
+        <div class="step"><div class="num">4</div><h2>念成谁的声音</h2>
+          <span class="opt">音色由模型决定</span></div>
+        <p class="hint">用上面「音色模型」里选中的模型。移调建议留自动，程序会按载体音高自己算。</p>
+        <div class="row">
+          <div class="keyval" id="rdKeyVal">自动<small>移调</small></div>
+          <label class="rdauto"><input type="checkbox" id="rdKeyAuto" checked>
+            <span>自动定移调</span></label>
+        </div>
+        <input type="range" id="rdKey" min="-12" max="12" step="1" value="0" disabled>
+        <div class="keyscale"><span>-12 低</span><span>0</span><span>+12 高</span></div>
+      </div>
+
+      <div class="card">
+        <div class="step"><div class="num">5</div><h2>开始朗读</h2></div>
+        <button class="btn" id="rdGo">念出来</button>
+        <div class="prog">
+          <div class="bar"><i id="rdBar"></i></div>
+          <div class="pmsg"><span id="rdMsg">填好文字后点上面按钮</span><span id="rdPct"></span></div>
+        </div>
+        <div class="out" id="rdOut">
+          <b>念好了</b>
+          <code id="rdOutPath"></code>
+          <audio id="rdResult" controls style="width:100%;margin:8px 0"></audio>
+          <div class="qa" id="rdQa">
+            <div class="top"><b id="rdQaScore">—</b><span>质量自检</span>
+              <em id="rdQaTag">—</em></div>
+            <div class="grid" id="rdQaGrid"></div>
+          </div>
+          <button class="btn mini ghost" id="rdReveal">打开输出文件夹</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="side">
+      <div class="card">
+        <h3>朗读和翻唱的区别</h3>
+        <ul class="how">
+          <li><b>1</b><span>翻唱是「已经有一段录音」，把它换成目标音色。</span></li>
+          <li><b>2</b><span>朗读是「还没有录音」，从文字直接生成，再换音色。</span></li>
+          <li><b>3</b><span>两者共用同一个模型、同一套质检，只是输入来源不同。</span></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>速度说明</h3>
+        <p class="hint" style="margin-bottom:0">
+          纯 CPU 处理，不是麦克风级实时。<br>
+          实测：3 秒的话约 12 秒出结果，15 秒约 30 秒。<br>
+          所以适合「写完再念」，不适合边说边出。
+        </p>
+      </div>
+      <div class="card">
+        <h3>常见问题</h3>
+        <details><summary>为什么要联网？</summary>
+          <p>文字转音节这一步用的是在线语音合成（免费、不要密钥）。
+             合成完立刻变声，音频不上传到别处。断网时这一步会失败，翻唱功能不受影响。</p></details>
+        <details><summary>念出来语气平怎么办？</summary>
+          <p>换个情绪（欢快/激动/悲伤差别很明显），或者在文字里加标点控制停顿。
+             换更口语化的写法也比书面语自然。</p></details>
       </div>
     </div>
   </div>
@@ -987,7 +1042,176 @@ $('#player').addEventListener('timeupdate', e => {
 $('#playIn').onclick = () => play('in');
 $('#playOut').onclick = () => play('out');
 
-/* 队列列表：最多显示 5 条，可单独移除 */
+/* ================= v2.0 朗读模式 ================= */
+let rdMode = 'sing', rdOpts = null, rdBusy = false;
+
+function setMode(m){
+  rdMode = m;
+  document.querySelectorAll('.mode').forEach(b => {
+    b.classList.toggle('on', b.dataset.m === m);
+  });
+  $('#gridSing').style.display = (m === 'sing') ? '' : 'none';
+  $('#gridRead').style.display = (m === 'read') ? '' : 'none';
+  if (m === 'read' && !rdOpts) loadReadOpts();
+  try{ localStorage.setItem('rvc_mode', m); }catch(e){}
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+document.querySelectorAll('.mode').forEach(b => {
+  b.onclick = () => setMode(b.dataset.m);
+});
+
+async function loadReadOpts(){
+  try{
+    rdOpts = await (await fetch('/api/read/options')).json();
+  }catch(e){ return; }
+  // 情绪九宫格
+  $('#segEmo').innerHTML = (rdOpts.emotions || []).map((e, i) =>
+    '<label><input type="radio" name="emo" value="' + e.id + '"' +
+    (e.id === 'neutral' ? ' checked' : '') + '><span>' + e.label + '</span></label>'
+  ).join('');
+  // 载体语音下拉
+  $('#rdVoice').innerHTML = '<option value="">自动（按模型音域选）</option>' +
+    (rdOpts.voices || []).map(v =>
+      '<option value="' + v.id + '">' + v.name + ' · ' + v.note +
+      (v.gender === 'male' ? ' · 男' : ' · 女') + '</option>'
+    ).join('');
+}
+
+// 字数与预估
+function rdStats(){
+  const t = $('#rdText').value.trim();
+  const n = t.length;
+  $('#rdCount').textContent = n + ' 字';
+  // 中文约 4.5 字/秒；变声 RTF 按实测 2.8 估
+  if (n >= 10){
+    const sec = n / 4.5;
+    const need = Math.round(sec * 2.8 + 12);
+    $('#rdEst').textContent = '预计约 ' + sec.toFixed(0) + ' 秒音频 · 处理约 ' +
+      (need >= 60 ? Math.round(need/60) + ' 分钟' : need + ' 秒');
+  } else {
+    $('#rdEst').textContent = '';
+  }
+  $('#rdGo').disabled = (n < 2);
+}
+$('#rdText').addEventListener('input', rdStats);
+
+// 自动移调开关
+$('#rdKeyAuto').addEventListener('change', e => {
+  $('#rdKey').disabled = e.target.checked;
+  $('#rdKeyVal').innerHTML = e.target.checked
+    ? '自动<small>移调</small>'
+    : '<span id="rdKeyNum">0</span><small>半音</small>';
+  if (!e.target.checked){
+    $('#rdKey').oninput = ev => {
+      const v = +ev.target.value;
+      $('#rdKeyVal').innerHTML = (v > 0 ? '+' : '') + v + '<small>半音</small>';
+    };
+  }
+});
+
+// 试听语调（只合成载体）
+$('#rdPreview').onclick = async () => {
+  const btn = $('#rdPreview');
+  btn.disabled = true;
+  $('#rdPrevMsg').textContent = '合成中…';
+  const text = ($('#rdText').value.trim() || '你好，这是我的声音。').slice(0, 120);
+  const emo = (document.querySelector('input[name=emo]:checked') || {}).value || 'neutral';
+  try{
+    const j = await (await fetch('/api/read/preview', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text: text, emotion: emo,
+                            voice: $('#rdVoice').value || null})})).json();
+    if (j.ok){
+      const a = $('#rdPlayer');
+      a.style.display = 'block';
+      a.src = '/api/audio?which=preview&t=' + Date.now();
+      a.play().catch(()=>{});
+      $('#rdPrevMsg').textContent = j.voice + ' / ' + j.emotion;
+    } else {
+      $('#rdPrevMsg').textContent = j.error || '失败';
+    }
+  }catch(e){
+    $('#rdPrevMsg').textContent = '网络错误';
+  }
+  btn.disabled = false;
+};
+
+// 开始朗读
+$('#rdGo').onclick = async () => {
+  const text = $('#rdText').value.trim();
+  if (text.length < 2) return;
+  rdBusy = true;
+  $('#rdGo').disabled = true;
+  $('#rdOut').classList.remove('on');
+  $('#rdBar').style.width = '0%';
+  $('#rdPct').textContent = '';
+  $('#rdMsg').textContent = '提交中…';
+  const emo = (document.querySelector('input[name=emo]:checked') || {}).value || 'neutral';
+  const body = {
+    text: text,
+    emotion: emo,
+    voice: $('#rdVoice').value || null,
+    key: $('#rdKeyAuto').checked ? null : +$('#rdKey').value,
+    index_rate: +($('#idxrate').value || 50) / 100
+  };
+  try{
+    const j = await (await fetch('/api/read', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body)})).json();
+    if (!j.ok){
+      $('#rdMsg').textContent = j.error || '提交失败';
+      rdBusy = false;
+      $('#rdGo').disabled = false;
+    }
+  }catch(e){
+    $('#rdMsg').textContent = '网络错误';
+    rdBusy = false;
+    $('#rdGo').disabled = false;
+  }
+};
+
+$('#rdReveal').onclick = async () => {
+  await fetch('/api/reveal', {method: 'POST'});
+};
+
+function rdRender(s){
+  // 进度与提示（朗读进行中由 poll 调用）
+  if (s.stage === 'reading'){
+    const p = Math.round((s.frac || 0) * 100);
+    $('#rdBar').style.width = p + '%';
+    $('#rdPct').textContent = p + '%';
+    $('#rdMsg').textContent = s.msg || '';
+  }
+  if (s.stage === 'done' && s.read){
+    rdBusy = false;
+    $('#rdGo').disabled = ($('#rdText').value.trim().length < 2);
+    $('#rdBar').style.width = '100%';
+    $('#rdPct').textContent = '100%';
+    $('#rdMsg').textContent = s.msg || '完成';
+    $('#rdOut').classList.add('on');
+    $('#rdOutPath').textContent = s.output || '';
+    const a = $('#rdResult');
+    a.src = '/api/audio?which=out&t=' + Date.now();
+    const q = s.qa;
+    if (q){
+      $('#rdQa').classList.add('on');
+      $('#rdQaScore').textContent = q.score;
+      $('#rdQaTag').textContent = q.score >= 75 ? '可用' : '建议复查';
+      $('#rdQaTag').className = q.score >= 75 ? '' : 'warn';
+      $('#rdQaGrid').innerHTML =
+        '<div><span>谐波度</span><b>' + q.harmonicity.toFixed(2) + '</b></div>' +
+        '<div><span>低频残留</span><b>' + q.low_residual_db.toFixed(1) + ' dB</b></div>';
+    } else {
+      $('#rdQa').classList.remove('on');
+    }
+  }
+  if (s.stage === 'error' && rdBusy){
+    rdBusy = false;
+    $('#rdGo').disabled = ($('#rdText').value.trim().length < 2);
+    $('#rdMsg').textContent = s.error || '出错了';
+  }
+}
+
 function renderQueue(q, cur){
   const box = $('#qlist');
   if(!q || !q.length){ box.classList.remove('on'); box.innerHTML = ''; return; }
@@ -1012,6 +1236,7 @@ function renderQueue(q, cur){
 async function poll(){
   clearTimeout(timer);
   const s = await (await fetch('/api/state')).json();
+  try{ rdRender(s); }catch(e){}
   if (s.imported && s.imported !== lastImported){
     lastImported = s.imported;
     meta = await (await fetch('/api/meta')).json();
@@ -1107,7 +1332,15 @@ async function poll(){
   }
 }
 
-loadMeta().then(() => { loadPrefs(); poll(); });
+loadMeta().then(() => {
+  loadPrefs();
+  try{
+    const m = localStorage.getItem('rvc_mode');
+    if (m === 'read') setMode('read');
+  }catch(e){}
+  rdStats();
+  poll();
+});
 </script></body></html>
 """
 
@@ -1129,6 +1362,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urlparse(self.path)
+        if u.path == "/api/read/options":
+            from rvc_cpu import tts as _tts
+            return self._json({"ok": True,
+                               "voices": _tts.list_voices(),
+                               "emotions": _tts.list_emotions()})
+
         if u.path == "/":
             data = PAGE.encode("utf-8")
             self.send_response(200)
@@ -1145,6 +1384,8 @@ class Handler(BaseHTTPRequestHandler):
             st = get_state()
             if which == "in":
                 p = st.get("input") or ""
+            elif which == "preview":
+                p = st.get("preview_read") or ""
             else:
                 outs = st.get("outputs") or ([st["output"]] if st.get("output") else [])
                 p = outs[idx] if 0 <= idx < len(outs) else (outs[-1] if outs else "")
@@ -1309,6 +1550,50 @@ class Handler(BaseHTTPRequestHandler):
                           analysis=None if not new_input else st.get("analysis"))
             log("从队列移除：" + os.path.basename(path_to_drop))
             return self._json({"ok": True, "count": len(q)})
+
+        if u.path == "/api/read":
+            st = get_state()
+            if st["stage"] in ("running", "loading", "separating", "analyzing",
+                               "importing", "reading"):
+                return self._json({"ok": False, "error": "正在忙，等一下"})
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                return self._json({"ok": False, "error": "文本是空的"})
+            if len(text) > 5000:
+                return self._json({"ok": False,
+                                   "error": "文本太长了（%d 字），请分几次，单次上限 5000 字"
+                                            % len(text)})
+            from app.reading import run_read
+            threading.Thread(
+                target=run_read,
+                args=(text,
+                      str(payload.get("emotion") or "neutral"),
+                      payload.get("voice") or None,
+                      payload.get("key"),
+                      float(payload.get("index_rate", 0.5)),
+                      str(payload.get("device") or "auto")),
+                daemon=True).start()
+            return self._json({"ok": True, "chars": len(text)})
+
+        if u.path == "/api/read/preview":
+            # 只合成载体（不变声），用来挑声音/情绪，很快
+            st = get_state()
+            if st["stage"] in ("running", "loading", "separating", "analyzing",
+                               "importing", "reading"):
+                return self._json({"ok": False, "error": "正在忙，等一下"})
+            text = str(payload.get("text") or "").strip() or "你好，这是我的声音。"
+            from rvc_cpu import tts as _tts
+            pv = os.path.join(WORK, "_朗读试听.wav")
+            try:
+                info = _tts.synth(text[:120], pv,
+                                  voice_id=payload.get("voice") or None,
+                                  emotion=str(payload.get("emotion") or "neutral"))
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)})
+            set_state(preview_read=pv)
+            log("试听载体：%s / %s" % (info["voice"]["name"], info["emotion"]))
+            return self._json({"ok": True, "voice": info["voice"]["name"],
+                               "emotion": info["emotion"]})
 
         if u.path == "/api/abort":
             _abort = True

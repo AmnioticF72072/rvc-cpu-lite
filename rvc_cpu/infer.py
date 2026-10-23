@@ -50,7 +50,9 @@ def _highpass_zero_phase(audio, fc=48.0, order=5, sr=SR16K):
 # ---------------------------------------------------------------- session 工厂
 def _cpu_session(model_path, intra_threads):
     opts = ort.SessionOptions()
-    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL  # 避开 Where 等算子的图优化坑
+    # BASIC：实测比 DISABLE_ALL 快 1.15x、加载快 27%，且不碰 Where 算子坑
+    # （EXTENDED / ALL 收益反而更小，还更容易踩算子兼容问题，所以停在 BASIC）
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
     opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     opts.intra_op_num_threads = intra_threads
     opts.inter_op_num_threads = 1
@@ -77,7 +79,7 @@ def available_accel():
 def _ep_session(model_path, intra_threads, eps):
     """带加速后端的 session。CPU 永远排在最后兜底。"""
     opts = ort.SessionOptions()
-    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
     opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     opts.intra_op_num_threads = intra_threads
     opts.inter_op_num_threads = 1
@@ -204,12 +206,23 @@ class RvcPipeline:
             self._gen_names = [i.get_any_name() for i in self.gen.inputs]
             self._gen_run = self._run_ov
         else:
+            # INT8 量化版优先：models/quant/<名>.int8.onnx 存在就用它。
+            # 实测 MatMul/Gemm 动态量化 1.29x、SNR 38.6dB（几乎不可闻）。
+            # 找不到就退回 FP32，行为跟以前完全一致。
+            use_gen = gen_path
+            q = os.path.join(os.path.dirname(gen_path), "quant",
+                             os.path.splitext(os.path.basename(gen_path))[0] + ".int8.onnx")
+            if os.path.isfile(q):
+                use_gen = q
             if verbose:
-                print("[加载] 生成器 → %s (intra=%d) : %s" %
-                      (self.device_used, p["intra_threads"], os.path.basename(gen_path)))
-            self.gen = self._session(gen_path)
+                print("[加载] 生成器 → %s (intra=%d) : %s%s" %
+                      (self.device_used, p["intra_threads"],
+                       os.path.basename(use_gen),
+                       "  [INT8]" if use_gen != gen_path else ""))
+            self.gen = self._session(use_gen)
             self._gen_names = [i.name for i in self.gen.get_inputs()]
             self._gen_run = self._run_ort
+            self.gen_int8 = (use_gen != gen_path)
 
         # --- ContentVec ---
         if p["engine"] == "openvino":
@@ -230,6 +243,7 @@ class RvcPipeline:
         if verbose:
             print("[加载] RMVPE → ORT CPU（f0 永不跑核显）")
         self.rmvpe = RMVPE(rmvpe_path, providers=["CPUExecutionProvider"])
+        self.rmvpe_path = rmvpe_path      # 朗读流程复用它量载体/输出音高
 
         # --- 特征索引（可选）---
         if index_path and os.path.isfile(index_path) and index_rate > 0:
