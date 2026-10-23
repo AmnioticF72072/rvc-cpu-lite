@@ -28,7 +28,7 @@ OUT = os.path.join(ROOT, "输出")
 MODELS = os.path.join(ROOT, "models")
 MODEL_STAGE = os.path.join(WORK, "_导入暂存")
 PORT = int(os.environ.get("RVC_GUI_PORT", "8790"))
-VERSION = "Plus 1.2"
+VERSION = "Plus 1.3"
 
 sys.path.insert(0, ROOT)
 
@@ -45,6 +45,7 @@ _state = {
     "log": [],
     "model_ready": False,
     "analysis": None,
+    "qa": None,               # 转换后的质量自检结果
     "started_at": 0.0,
     "imported": "",
 }
@@ -83,11 +84,16 @@ def model_paths():
 
 
 def invalidate():
-    """模型切换 / 导入 / 删除后调用：丢掉已加载流水线与元数据缓存。"""
+    """模型切换 / 导入 / 删除后调用：丢掉已加载流水线与元数据缓存。
+
+    同时作废已有的音高分析结果 —— 那个建议是拿"旧模型的音域画像"算出来的，
+    换了模型就失效了，留在界面上会误导人。
+    """
     global _pipe, _pipe_device, _meta_cache
     _pipe = None
     _pipe_device = None
     _meta_cache = None
+    set_state(analysis=None)
 
 
 def meta():
@@ -177,26 +183,32 @@ def run_analyze(path):
     try:
         from rvc_cpu.calibrate import analyze_file, load_profile, suggest
         from rvc_cpu import models as mm
+        from rvc_cpu.ultra_lite import segment_curve
 
         _, _, rmv, _ = model_paths()
         set_state(stage="analyzing", frac=0.05, msg="分析音高（第一次约 5~10 秒）…")
-        stats = analyze_file(rmv, path, progress=lambda f, m: set_state(
-            stage="analyzing", frac=0.05 + 0.9 * f, msg=m))
+        stats, f0 = analyze_file(rmv, path, return_f0=True,
+                                 progress=lambda f, m: set_state(
+                                     stage="analyzing", frac=0.05 + 0.9 * f, msg=m))
         if not stats:
             set_state(stage="idle", frac=0, analysis=None,
                       msg="没检测到人声，这段可能是静音或纯伴奏")
             return
         prof = load_profile(MODELS, mm.active_name() or "myvoice51")
         r = suggest(stats, prof)
+        # 分段曲线：直接复用刚才那份 RMVPE 结果，不再跑第二遍
+        segs = segment_curve(f0, sr_f0=50.0, win_sec=10.0)
+        segs = [s for s in segs if not s.get("silence")]
         set_state(stage="idle", frac=0,
                   analysis={"stats": stats, "key": r["key"], "reason": r["reason"],
                             "shifted": r.get("shifted", {}),
+                            "segments": segs,
                             "profile": {"name": prof.get("name", ""),
                                         "lo": prof["target_lo"], "hi": prof["target_hi"],
                                         "p95": prof["p95_max"]}},
                   msg="分析完成：建议 %+d 半音" % r["key"])
-        log("音高分析：中位 %.0f / 70 分位 %.0f / 95 分位 %.0f → 建议 %+d" % (
-            stats["median"], stats["p70"], stats["p95"], r["key"]))
+        log("音高分析：中位 %.0f / 70 分位 %.0f / 95 分位 %.0f → 建议 %+d（%d 段）" % (
+            stats["median"], stats["p70"], stats["p95"], r["key"], len(segs)))
     except Exception as e:
         set_state(stage="error", error="%s: %s" % (type(e).__name__, e), msg="分析失败")
         log("分析失败：" + str(e))
@@ -260,6 +272,23 @@ def run_job(files, key, index_rate, sep_mode, device="auto"):
                 pipe.convert_file(src, out_path, f0_up_key=int(key), on_progress=prog)
                 outs.append(out_path)
                 log("完成：" + out_path)
+
+                # 质量自检：单文件必跑；批量只跑最后一个（全跑要多等一分多钟）
+                if total == 1 or i == total - 1:
+                    set_state(msg="正在自检输出质量…")
+                    try:
+                        import soundfile as _sf
+                        from rvc_cpu.ultra_lite import qa_scan
+                        _x, _sr = _sf.read(out_path, dtype="float32", always_2d=True)
+                        rep = qa_scan(_x.mean(1), _sr)
+                        rep["file"] = os.path.basename(out_path)
+                        set_state(qa=rep)
+                        log("自检 %d 分｜谐波度 %.2f｜低频残留 %.1f dB%s"
+                            % (rep["score"], rep["harmonicity"], rep["low_residual_db"],
+                               "｜" + rep["tips"][0] if rep["tips"] else ""))
+                    except Exception as _e:
+                        set_state(qa=None)
+                        log("自检跳过：" + str(_e)[:70])
             except Exception as one:
                 m = str(one)
                 if "已取消" in m or _abort:
@@ -429,6 +458,49 @@ PAGE = r"""<!doctype html>
   .ana .k div{font-size:12px;color:#5d6c82}
   .ana .k b{display:block;font-size:16.5px;color:#0e2a4d;font-weight:700}
   .ana .why{font-size:12.5px;color:#41526b;line-height:1.55}
+  /* 队列列表：拖错了能单独删掉一个 */
+  .qlist{display:none;flex-direction:column;gap:5px;margin-top:9px}
+  .qlist.on{display:flex}
+  .qlist .qi{display:flex;align-items:center;gap:8px;padding:6px 10px;
+    border-radius:9px;background:rgba(10,132,255,.045);
+    border:1px solid rgba(10,132,255,.1);font-size:12px;color:#3a4c66}
+  .qlist .qi span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .qlist .qi b{font-weight:700;color:#0e2a4d;flex:none;font-size:11px}
+  .qlist .qi button{border:none;background:transparent;color:#9aa8ba;cursor:pointer;
+    font-size:15px;line-height:1;padding:2px 4px;border-radius:5px;flex:none}
+  .qlist .qi button:hover{background:rgba(224,90,104,.12);color:#c9434f}
+  .qlist .more{font-size:11.5px;color:#9aa8ba;padding-left:10px}
+  /* 分段音高条：一眼看出哪段偏高会破 */
+  .segs{display:flex;align-items:flex-end;gap:2px;height:44px;margin-top:12px;
+    padding:0 1px;border-bottom:1px solid rgba(10,132,255,.18)}
+  .segs i{flex:1;min-width:2px;border-radius:2px 2px 0 0;background:#7fb4f0;
+    transition:background .2s}
+  .segs i.hi{background:#f0a04b}
+  .segs i.over{background:#e05a68}
+  .segs-legend{display:flex;gap:12px;margin-top:7px;font-size:11px;color:#7a8899}
+  .segs-legend em{font-style:normal;display:inline-flex;align-items:center;gap:5px}
+  .segs-legend em::before{content:"";width:8px;height:8px;border-radius:2px;
+    background:#7fb4f0}
+  .segs-legend em.hi::before{background:#f0a04b}
+  .segs-legend em.over::before{background:#e05a68}
+
+  /* 输出质量自检 */
+  .qa{display:none;margin-top:14px;padding:14px 15px;border-radius:16px;
+    background:rgba(248,250,253,.9);border:1px solid rgba(10,132,255,.13)}
+  .qa.on{display:block}
+  .qa .top{display:flex;align-items:baseline;gap:10px;margin-bottom:9px}
+  .qa .top b{font:800 26px/1 Consolas,monospace;color:#0e2a4d}
+  .qa .top span{font-size:12px;color:#5d6c82}
+  .qa .top em{font-style:normal;margin-left:auto;font-size:11.5px;font-weight:700;
+    padding:4px 9px;border-radius:7px;background:rgba(14,158,110,.12);color:#0e9e6e}
+  .qa .top em.warn{background:rgba(224,90,104,.12);color:#c9434f}
+  .qa .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:7px 14px}
+  .qa .grid div{font-size:11.5px;color:#5d6c82;display:flex;justify-content:space-between;
+    padding:5px 0;border-bottom:1px dashed rgba(10,132,255,.1)}
+  .qa .grid b{font:700 12.5px Consolas,monospace;color:#0e2a4d}
+  .qa .tips{margin-top:9px;font-size:12px;color:#a56a1e;line-height:1.6}
+  .qa .tips div{padding-left:14px;position:relative}
+  .qa .tips div::before{content:"·";position:absolute;left:4px}
 
   .out{display:none;margin-top:14px;padding:14px 15px;border-radius:16px;
     background:rgba(10,150,95,.07);border:1px solid rgba(10,150,95,.18)}
@@ -456,6 +528,31 @@ PAGE = r"""<!doctype html>
   .warn{font-size:12px;color:#9a6b00;background:rgba(255,190,0,.1);border:1px solid rgba(255,190,0,.22);
     padding:8px 11px;border-radius:12px;margin-top:10px;display:none}
   .warn.on{display:block}
+  /* ---------- v1.3 视觉精修（只调整观感，不改结构） ---------- */
+  /* 流程卡左侧竖条：一眼看出这是第几步 */
+  .card{position:relative}
+  .card:has(.step)::before{content:"";position:absolute;left:0;top:20px;bottom:20px;
+    width:3px;border-radius:0 3px 3px 0;
+    background:linear-gradient(180deg,#0a84ff,#6fb0ff 52%,rgba(111,176,255,0))}
+  /* 序号：加一层内高光，不再是纯色块 */
+  .num{box-shadow:0 2px 6px rgba(10,132,255,.26),inset 0 1px 0 rgba(255,255,255,.45)}
+  .step h2{letter-spacing:-.01em}
+  /* 说明文字再压一档，与标题拉开层级 */
+  .hint{color:#8a97a9}
+  /* 主操作按钮：渐变 + 悬停微上浮；禁用态保留形状只降饱和 */
+  #go{background:linear-gradient(180deg,#2b93ff,#0a84ff);
+    box-shadow:0 8px 22px -6px rgba(10,132,255,.5),inset 0 1px 0 rgba(255,255,255,.32);
+    transition:transform .18s ease,box-shadow .18s ease,background .18s ease}
+  #go:hover:not(:disabled){transform:translateY(-1px);
+    box-shadow:0 12px 28px -8px rgba(10,132,255,.58),inset 0 1px 0 rgba(255,255,255,.4)}
+  #go:active:not(:disabled){transform:translateY(0) scale(.997)}
+  #go:disabled{background:linear-gradient(180deg,#dae3ef,#cbd6e4);
+    box-shadow:0 4px 12px -8px rgba(20,40,80,.2),inset 0 1px 0 rgba(255,255,255,.55)}
+  /* 侧栏标题与正文层级 */
+  .side .card h3{letter-spacing:-.01em}
+  /* 结果区标题与路径更整齐 */
+  .out b{letter-spacing:-.01em}
+  .out code{letter-spacing:0}
 </style></head><body>
 <div class="wrap">
   <div class="top">
@@ -500,6 +597,7 @@ PAGE = r"""<!doctype html>
           <span id="qinfo" style="font-size:12.3px;color:#7a8899">还没选文件</span>
           <button class="btn mini ghost" id="btnClear" style="display:none">清空</button>
         </div>
+        <div class="qlist" id="qlist"></div>
       </div>
 
       <!-- 2 去和声 -->
@@ -529,6 +627,10 @@ PAGE = r"""<!doctype html>
             <div>建议移调<b id="aKey">—</b></div>
           </div>
           <div class="why" id="aWhy"></div>
+          <div class="segs" id="aSegs"></div>
+          <div class="segs-legend" id="aSegLegend" style="display:none">
+            <em>正常</em><em class="hi">偏高</em><em class="over">会破音</em>
+          </div>
         </div>
         <div class="row" style="margin-top:14px">
           <div class="keyval" id="keyval">0<small>半音</small></div>
@@ -575,6 +677,12 @@ PAGE = r"""<!doctype html>
             <button class="btn mini ghost" id="playOut">试听结果</button>
           </div>
           <audio id="player" controls style="width:100%;display:none"></audio>
+          <div class="qa" id="qaBox">
+            <div class="top"><b id="qaScore">—</b><span>质量自检</span>
+              <em id="qaTag">—</em></div>
+            <div class="grid" id="qaGrid"></div>
+            <div class="tips" id="qaTips"></div>
+          </div>
           <button class="btn mini ghost" id="reveal">打开输出文件夹</button>
         </div>
         <div class="logbox" id="log" hidden></div>
@@ -793,7 +901,7 @@ function setKey(v, fromAuto){
     (v>0 ? '调高 '+v+' 个半音（男声模型唱女声素材常用 +12）'
          : '调低 '+(-v)+' 个半音（女声素材配男声模型常用 -12）');
 }
-$('#key').oninput = e => { autoKey = null; setKey(+e.target.value, false); };
+$('#key').oninput = e => { autoKey = null; setKey(+e.target.value, false); savePrefs(); };
 
 $('#btnAna').onclick = async () => {
   if(!picked) return;
@@ -806,7 +914,42 @@ $('#btnAna').onclick = async () => {
 $('#idxrate').oninput = e => {
   const v = +e.target.value / 100;
   $('#idxval').innerHTML = v.toFixed(2) + '<small>强度</small>';
+  savePrefs();
 };
+
+/* 参数记忆：移调 / 检索强度 / 去和声 / 设备，下次打开保持上次的选择 */
+const PREF_KEY = 'rvc_prefs_v1';
+function savePrefs(){
+  try{
+    localStorage.setItem(PREF_KEY, JSON.stringify({
+      key: +$('#key').value,
+      idx: +$('#idxrate').value,
+      sep: (document.querySelector('input[name=sep]:checked')||{}).value || 'none',
+      dev: (document.querySelector('input[name=dev]:checked')||{}).value || 'auto'
+    }));
+  }catch(e){}
+}
+function loadPrefs(){
+  let p;
+  try{ p = JSON.parse(localStorage.getItem(PREF_KEY) || '{}'); }catch(e){ return; }
+  if(typeof p.idx === 'number' && p.idx >= 0 && p.idx <= 80){
+    $('#idxrate').value = p.idx;
+    $('#idxval').innerHTML = (p.idx / 100).toFixed(2) + '<small>强度</small>';
+  }
+  if(typeof p.key === 'number' && p.key >= -12 && p.key <= 12){
+    autoKey = null; setKey(p.key, false);
+  }
+  if(p.sep){
+    const r = document.querySelector('input[name=sep][value="' + p.sep + '"]');
+    if(r && !r.disabled) r.checked = true;
+  }
+  if(p.dev){
+    const r = document.querySelector('input[name=dev][value="' + p.dev + '"]');
+    if(r) r.checked = true;
+  }
+}
+document.querySelectorAll('input[name=sep],input[name=dev]').forEach(
+  r => r.addEventListener('change', savePrefs));
 
 $('#go').onclick = async () => {
   if(!picked) return;
@@ -824,17 +967,47 @@ $('#btnAbort').onclick = () => fetch('/api/abort', {method:'POST'});
 $('#btnClear').onclick = async () => {
   await fetch('/api/clear', {method:'POST'});
   setPicked(''); $('#qinfo').textContent = '还没选文件';
+  renderQueue([], '');
   $('#btnClear').style.display = 'none'; $('#outbox').classList.remove('on');
+  $('#qaBox').classList.remove('on');
   $('#pmsg').textContent = '选好文件后点上面按钮';
 };
+let lastPos = 0;   // A/B 对比要落在同一位置，否则切过去从头播没法比
 function play(which){
   const a = $('#player');
+  const pos = (a.currentTime > 0.3 && !a.ended) ? a.currentTime : lastPos;
   a.style.display = 'block';
   a.src = '/api/audio?which=' + which + '&t=' + Date.now();
+  a.onloadedmetadata = () => { try { a.currentTime = pos; } catch(e){} };
   a.play().catch(()=>{});
 }
+$('#player').addEventListener('timeupdate', e => {
+  if (!e.target.paused) lastPos = e.target.currentTime;
+});
 $('#playIn').onclick = () => play('in');
 $('#playOut').onclick = () => play('out');
+
+/* 队列列表：最多显示 5 条，可单独移除 */
+function renderQueue(q, cur){
+  const box = $('#qlist');
+  if(!q || !q.length){ box.classList.remove('on'); box.innerHTML = ''; return; }
+  box.classList.add('on');
+  const show = q.slice(0, 5);
+  box.innerHTML = show.map(p => {
+    const nm = p.split(/[\\/]/).pop();
+    const mark = (p === cur) ? '<b>当前</b>' : '';
+    return '<div class="qi">' + mark + '<span title="' + nm + '">' + nm +
+      '</span><button data-p="' + encodeURIComponent(p) + '" title="从队列移除">×</button></div>';
+  }).join('') + (q.length > 5 ? '<div class="more">还有 ' + (q.length - 5) + ' 个…</div>' : '');
+  box.querySelectorAll('button[data-p]').forEach(b => {
+    b.onclick = async () => {
+      await fetch('/api/queue/remove', {method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({path: decodeURIComponent(b.dataset.p)})});
+      poll();
+    };
+  });
+}
 
 async function poll(){
   clearTimeout(timer);
@@ -848,11 +1021,24 @@ async function poll(){
   const p = Math.round((s.frac||0)*100);
   $('#bar').style.width = p+'%';
   $('#pct').textContent = p+'%';
-  $('#pmsg').textContent = (s.phase ? '['+s.phase+'] ' : '') + (s.msg||'');
+  let msg = (s.phase ? '['+s.phase+'] ' : '') + (s.msg||'');
+  // 预计剩余：按"已用时间 / 已完成进度"反推，进度太小时不显示（会乱跳）
+  if(s.started_at && s.frac > 0.06 && s.frac < 0.995 &&
+     ['running','separating'].includes(s.stage)){
+    const used = Date.now()/1000 - s.started_at;
+    const left = Math.max(0, used / s.frac - used);
+    if(left >= 5) msg += ' · 剩余约 ' +
+      (left >= 60 ? Math.round(left/60) + ' 分' : Math.round(left) + ' 秒');
+  }
+  $('#pmsg').textContent = msg;
   if(s.device_used) $('#devInfo').textContent = '实际设备：' + s.device_used;
+  renderQueue(s.queue, s.input);
   if(s.queue && s.queue.length){
     $('#qinfo').textContent = s.queue.length + ' 个文件已加入队列';
     $('#btnClear').style.display = 'inline-flex';
+  } else {
+    $('#qinfo').textContent = '还没选文件';
+    $('#btnClear').style.display = 'none';
   }
 
   if(s.analysis){
@@ -863,7 +1049,40 @@ async function poll(){
     $('#aP95').textContent = Math.round(st.p95) + ' Hz';
     $('#aKey').textContent = (a.key>0?'+':'') + a.key;
     $('#aWhy').textContent = a.reason;
+    // 分段音高条：竖向高度按 95 分位映射（以 500Hz 为顶），超过 375 标橙、超 450 标红
+    const segs = a.segments || [];
+    const box = $('#aSegs');
+    if (segs.length){
+      box.innerHTML = segs.map(sg => {
+        const h = Math.max(6, Math.min(100, sg.p95 / 5));
+        const cls = sg.p95 > 450 ? 'over' : (sg.p95 > 375 ? 'hi' : '');
+        return '<i class="' + cls + '" style="height:' + h + '%" title="' +
+               sg.t0 + '~' + sg.t1 + 's · 95分位 ' + Math.round(sg.p95) + 'Hz"></i>';
+      }).join('');
+      $('#aSegLegend').style.display = 'flex';
+    } else {
+      box.innerHTML = ''; $('#aSegLegend').style.display = 'none';
+    }
     if(autoKey !== a.key){ autoKey = a.key; setKey(a.key, true); }
+  }
+
+  // 输出质量自检
+  if(s.qa){
+    const q = s.qa;
+    $('#qaBox').classList.add('on');
+    $('#qaScore').textContent = q.score;
+    const good = q.score >= 75;
+    const tag = $('#qaTag');
+    tag.textContent = good ? '可用' : '建议复查';
+    tag.className = good ? '' : 'warn';
+    $('#qaGrid').innerHTML =
+      '<div><span>谐波度</span><b>' + q.harmonicity.toFixed(2) + '</b></div>' +
+      '<div><span>低频残留</span><b>' + q.low_residual_db.toFixed(1) + ' dB</b></div>' +
+      '<div><span>电平稳定</span><b>' + q.level_std_db.toFixed(1) + ' dB</b></div>' +
+      '<div><span>峰值</span><b>' + q.peak.toFixed(2) + '</b></div>';
+    $('#qaTips').innerHTML = (q.tips || []).map(t => '<div>' + t + '</div>').join('');
+  } else {
+    $('#qaBox').classList.remove('on');
   }
 
   if(['analyzing','separating','loading','running','importing'].includes(s.stage)){
@@ -888,7 +1107,7 @@ async function poll(){
   }
 }
 
-loadMeta().then(poll);
+loadMeta().then(() => { loadPrefs(); poll(); });
 </script></body></html>
 """
 
@@ -994,8 +1213,15 @@ class Handler(BaseHTTPRequestHandler):
                                             "m4a 请先转成 wav"
                                             % str(_e).split(":")[-1].strip()[:60]})
 
-            set_state(input=dst, queue=q, output="", error="", analysis=None,
-                      outputs=[])
+            # 转换中上传：只追加队列，不动当前输入和结果区，
+            # 否则界面上"正在转换的文件"会突然变成刚落进来的那个。
+            busy = get_state()["stage"] in ("running", "loading", "separating",
+                                            "analyzing", "importing")
+            if busy:
+                set_state(queue=q)
+            else:
+                set_state(input=dst, queue=q, output="", error="", analysis=None,
+                          outputs=[])
             return self._json({"ok": True, "name": safe, "count": len(q)})
 
         # 模型文件暂存上传：必须放在下面通用读 body 之前，自己读流。
@@ -1060,10 +1286,29 @@ class Handler(BaseHTTPRequestHandler):
             if not files:
                 files = [p]
             set_state(stage="loading", frac=0.01, msg="准备中…", error="", output="",
-                      outputs=[], phase="", total=len(files))
+                      outputs=[], phase="", total=len(files), qa=None)
             threading.Thread(target=run_job, args=(files, key, rate, sep_mode, device),
                              daemon=True).start()
             return self._json({"ok": True, "files": len(files)})
+
+        if u.path == "/api/queue/remove":
+            path_to_drop = str(payload.get("path") or "").strip()
+            st = get_state()
+            q = [x for x in (st.get("queue") or []) if os.path.isfile(x)]
+            if path_to_drop not in q:
+                return self._json({"ok": False, "error": "队列里没有这个文件"})
+            q.remove(path_to_drop)
+            busy = st["stage"] in ("running", "loading", "separating",
+                                   "analyzing", "importing")
+            if busy:
+                # 任务进行中：只动队列，别碰正在处理的那个
+                set_state(queue=q)
+            else:
+                new_input = st["input"] if st["input"] in q else (q[0] if q else "")
+                set_state(queue=q, input=new_input, output="", qa=None,
+                          analysis=None if not new_input else st.get("analysis"))
+            log("从队列移除：" + os.path.basename(path_to_drop))
+            return self._json({"ok": True, "count": len(q)})
 
         if u.path == "/api/abort":
             _abort = True
