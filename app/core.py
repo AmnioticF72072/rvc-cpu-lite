@@ -35,6 +35,7 @@ _state = {
     "error": "",
     "log": [],
     "model_ready": False,
+    "active_model": "",
     "analysis": None,
     "qa": None,
     "started_at": 0.0,
@@ -46,6 +47,7 @@ _state = {
 
 _pipe = None
 _pipe_device = None
+_pipe_model = None      # 当前管线对应的模型名（防串模型）
 _meta_cache = None
 
 
@@ -125,28 +127,35 @@ def invalidate():
 
     同时作废已有音高分析 —— 那个建议是按旧模型音域算的，换模型就没意义了。
     """
-    global _pipe, _pipe_device, _meta_cache
+    global _pipe, _pipe_device, _pipe_model, _meta_cache
     _pipe = None
     _pipe_device = None
+    _pipe_model = None
     _meta_cache = None
     set_state(analysis=None)
 
 
 def ensure_pipeline(index_rate=0.0, device="auto"):
-    """模型只加载一次；设备变了重建 session。
+    """按「模型 + 设备」两个条件复用管线。
 
-    用 _pipe_lock 保护重建路径：管线常驻约 1 GB，两个请求同时进来各建一份，
-    16G 机器直接贴上限。
+    以前只判设备 —— 只要设备没变就直接复用旧管线。这意味着切换模型后，
+    如果哪条路径没走到 invalidate()，就会继续用上一个模型，而界面上显示的
+    已经是新模型了（"选了却不生效"）。现在把模型名也纳入判断，
+    哪怕漏了 invalidate 也不会串模型。
     """
-    global _pipe, _pipe_device
-    if _pipe is not None and _pipe_device == device:
+    global _pipe, _pipe_device, _pipe_model
+    from rvc_cpu import models as mm
+    want = mm.active_name() or ""
+
+    if _pipe is not None and _pipe_device == device and _pipe_model == want:
         _pipe.index_rate = float(index_rate)
         return _pipe
     with _pipe_lock:
-        if _pipe is not None and _pipe_device == device:
+        if _pipe is not None and _pipe_device == device and _pipe_model == want:
             _pipe.index_rate = float(index_rate)
             return _pipe
         if _pipe is not None:
+            log("模型有变化，重新加载：" + (want or "?"))
             try:
                 _pipe = None
                 import gc
@@ -160,16 +169,19 @@ def ensure_pipeline(index_rate=0.0, device="auto"):
             raise RuntimeError("models 目录里缺少模型文件：%s。请整个文件夹一起解压，"
                                "不要把 bat 单独拷出来。" % "、".join(missing))
         set_state(stage="loading", frac=0.02,
-                  msg="正在加载模型（第一次要 10~30 秒）…")
-        log("加载模型，设备偏好：" + device)
+                  msg="正在加载模型「%s」（第一次要 10~30 秒）…" % (want or "?"))
+        log("加载模型「%s」，设备偏好：%s" % (want or "?", device))
         from rvc_cpu.infer import RvcPipeline
         _pipe = RvcPipeline(gen, vec, rmv, index_path=idx,
                             index_rate=float(index_rate) if idx else 0.0,
                             protect=0.10, verbose=True, device=device)
         _pipe_device = device
+        _pipe_model = want
         set_state(model_ready=True,
-                  device_used=getattr(_pipe, "device_used", "CPU"))
-        log("模型就绪｜设备：" + getattr(_pipe, "device_used", "CPU")
+                  device_used=getattr(_pipe, "device_used", "CPU"),
+                  active_model=want)
+        log("模型就绪「%s」｜设备：%s" % (want or "?",
+                                        getattr(_pipe, "device_used", "CPU"))
             + ("｜特征索引：" + os.path.basename(idx) if idx else "")
             + ("｜INT8 生成器" if getattr(_pipe, "gen_int8", False) else ""))
     return _pipe

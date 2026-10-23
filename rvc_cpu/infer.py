@@ -452,8 +452,10 @@ class RvcPipeline:
                     pass
 
         _p(0.01, "读取音频…")
-        audio, sr = sf.read(in_path, dtype="float32", always_2d=True)
-        audio = audio.mean(1)
+        # 统一走 audio_io：坏文件在这里就翻成中文可操作提示，
+        # 不再把 libsndfile 的 "Unspecified internal error" 抛给用户
+        from .audio_io import read_audio
+        audio, sr = read_audio(in_path)
         if sr != SR16K:
             audio = soxr.resample(audio, sr, SR16K, quality="VHQ")
         _p(0.05, "重采样到 16k（%.1f 秒音频）" % (len(audio) / SR16K))

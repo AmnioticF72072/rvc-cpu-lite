@@ -145,8 +145,8 @@ def analyze_file(rmvpe_path, wav_path, progress=None, return_f0=False):
                 pass
 
     _p(0.1, "读取音频…")
-    audio, sr = sf.read(wav_path, dtype="float32", always_2d=True)
-    audio = audio.mean(1)
+    from .audio_io import read_audio
+    audio, sr = read_audio(wav_path)      # 已返回单声道
     if sr != 16000:
         audio = soxr.resample(audio, sr, 16000, quality="HQ")
     _p(0.35, "提取音高…")

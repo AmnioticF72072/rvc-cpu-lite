@@ -857,11 +857,28 @@ function renderModels(m){
       sm.textContent = '带索引';
       sp.appendChild(sm);
     }
+    // 坏模型：显示原因并禁止选择 —— 不然选中后点转换才炸，很难查
+    if (mm.broken){
+      inp.disabled = true;
+      const sb = document.createElement('small');
+      sb.textContent = '不可用';
+      sb.style.background = 'rgba(224,90,104,.14)';
+      sb.style.color = '#c9434f';
+      sp.appendChild(sb);
+      lb.title = mm.broken;
+      lb.style.opacity = '.55';
+    } else if (mm.active){
+      const sc = document.createElement('small');
+      sc.textContent = '使用中';
+      sc.style.background = 'rgba(14,158,110,.15)';
+      sc.style.color = '#0e9e6e';
+      sp.appendChild(sc);
+    }
     lb.appendChild(inp); lb.appendChild(sp);
     box.appendChild(lb);
   });
-  const cur = list.find(x => x.active) || list[0];
-  $('#curModel').textContent = cur.name;
+  const cur = list.find(x => x.active) || list.find(x => !x.broken) || list[0];
+  $('#curModel').textContent = cur ? cur.name : '无';
   const bits = [cur.mb + ' MB'];
   if (cur.tgt_sr) bits.push(cur.tgt_sr + ' Hz');
   if (cur.version) bits.push(cur.version);
@@ -1435,24 +1452,27 @@ class Handler(BaseHTTPRequestHandler):
             q = [x for x in (get_state().get("queue") or []) if os.path.isfile(x)]
             q.append(dst)
 
-            # 入库前先确认是能读的音频：否则要等到转换时才炸，
-            # 一个坏文件就能把整批队列拖垮（提示也很晚）。
+            # 入库前确认是"真能解码"的音频。
+            # 注意必须深校验（真解码），不能只 sf.info —— 损坏的 mp3 头是好的、
+            # 数据是坏的，只读头会放过它，然后到转换阶段才炸成
+            # "Unspecified internal error"（用户看不懂）。
             try:
-                import soundfile as _sf
-                _info = _sf.info(dst)
-                if not _info.frames or _info.samplerate <= 0:
-                    raise ValueError("音频是空的")
+                from rvc_cpu.audio_io import probe
+                sr_u, ch_u, sec_u = probe(dst, deep=True)
+                # 门槛跟界面提示、命令行提示保持一致（都是 2 秒）。
+                # ContentVec 的卷积栈对超短输入会报错，太短的素材本来也转不出东西。
+                if sec_u < 2.0:
+                    raise RuntimeError(
+                        "%s 只有 %.1f 秒，至少要 2 秒。"
+                        "（太短的话模型没有足够上下文，转出来会断断续续）"
+                        % (os.path.basename(dst), sec_u))
             except Exception as _e:
                 try:
                     q.remove(dst)
                     os.remove(dst)
                 except Exception:
                     pass
-                return self._json({"ok": False,
-                                   "error": "不是能识别的音频文件（%s）。"
-                                            "支持 wav / flac / ogg / aiff / mp3，"
-                                            "m4a 请先转成 wav"
-                                            % str(_e).split(":")[-1].strip()[:60]})
+                return self._json({"ok": False, "error": str(_e)})
 
             # 转换中上传：只追加队列，不动当前输入和结果区，
             # 否则界面上"正在转换的文件"会突然变成刚落进来的那个。

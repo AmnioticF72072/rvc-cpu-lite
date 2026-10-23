@@ -103,6 +103,7 @@ def list_models():
             mb = round(os.path.getsize(os.path.join(MODELS, stem + ".onnx")) / 1024 ** 2, 1)
         except Exception:
             pass
+        _ok, _why = _looks_like_onnx(os.path.join(MODELS, stem + ".onnx"))
         out.append({
             "name": stem,
             "mb": mb,
@@ -115,19 +116,23 @@ def list_models():
             "source": meta.get("source") or "",
             "imported_at": meta.get("imported_at") or "",
             "origin": meta.get("origin") or "",
+            # 坏文件要在列表里就暴露，而不是等用户选中、点转换时才炸
+            "broken": (not _ok) or "",
         })
 
+    good = [m for m in out if not m["broken"]]
     active = reg.get("active") or ""
-    if active and not any(m["name"] == active for m in out):
+    # 登记的那个已经坏了（文件被替换/损坏）→ 不能继续当默认
+    if active and not any(m["name"] == active for m in good):
         active = ""
     if not active:
-        # 没登记过：优先内置的 myvoice51，否则第一个
-        for m in out:
+        # 优先内置的 myvoice51，否则第一个能用的
+        for m in good:
             if m["name"] == "myvoice51":
                 active = m["name"]
                 break
-        if not active and out:
-            active = out[0]["name"]
+        if not active and good:
+            active = good[0]["name"]
     for m in out:
         m["active"] = (m["name"] == active)
     return out, active
@@ -322,6 +327,66 @@ def _introspect_onnx(path):
     return info
 
 
+def _looks_like_onnx(path):
+    """廉价判断：文件像不像 ONNX（读前 16 字节）。
+
+    ONNX 是 protobuf 序列化，合法模型开头基本都是 0x08（field1=ir_version, varint）。
+    音频文件开头是 RIFF / ID3 / OggS 等 —— 一眼就能区分。
+    这里不做完整校验（那要建 session，太重），只用来把明显不对的文件标记出来。
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except OSError:
+        return False, "读不到文件"
+    if not head:
+        return False, "文件是空的"
+    if head.startswith((b"RIFF", b"ID3", b"OggS", b"fLaC", b"FORM")):
+        return False, "这其实是音频文件，不是模型"
+    if head[0] == 0xFF and len(head) > 1 and (head[1] & 0xF0) == 0xF0:
+        return False, "这其实是音频文件，不是模型"
+    if head[:2] == b"PK":
+        return False, "这是压缩包，请先解压出 .onnx / .pth"
+    if head[0] != 0x08:
+        return False, "文件内容不像 ONNX（可能已损坏）"
+    return True, ""
+
+
+def _verify_onnx(path, stem=""):
+    """试加载一次 ONNX，确认它真的能当生成器用。
+
+    只判扩展名是不够的 —— 把音频/压缩包改个名字叫 .onnx 也能通过。
+    这里用最小 SessionOptions 建一次 session（不跑推理），失败就抛可读错误。
+    """
+    import onnxruntime as ort
+
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    opts.log_severity_level = 3
+    try:
+        sess = ort.InferenceSession(path, sess_options=opts,
+                                    providers=["CPUExecutionProvider"])
+    except Exception as e:
+        msg = str(e)
+        if "INVALID_PROTOBUF" in msg or "Protobuf parsing failed" in msg:
+            raise RuntimeError(
+                "「%s」不是有效的模型文件（解析失败）。\n"
+                "可能是文件下载不完整、或者把音频/其他文件改名成了 .onnx。"
+                "请重新获取模型，或直接导入 .pth 让它自动转换。" % (stem or "这个文件"))
+        if "NO_SUCHFILE" in msg:
+            raise RuntimeError("模型文件不存在或无法读取：%s" % (stem or path))
+        raise RuntimeError("这个模型加载不了：%s" % msg[:140])
+
+    # 生成器必须能接受 phone / pitch 类输入；名字不同但形状对也算通过
+    names = [i.name.lower() for i in sess.get_inputs()]
+    if not any(n in names for n in ("phone", "phone_lengths", "pitch", "pitchf")):
+        raise RuntimeError(
+            "「%s」看起来不是 RVC 生成器模型（输入层对不上）。\n"
+            "请确认导入的是 .pth 权重或 RVC 导出的 .onnx，不是音色索引或其他模型。"
+            % (stem or "这个文件"))
+    return True
+
+
 def _write_minimal_json(onnx_path, stem):
     """没有旁挂 .json 时，根据 ONNX 图推断着写一个（推理端优先读它）。"""
     info = _introspect_onnx(onnx_path)
@@ -361,6 +426,19 @@ def import_from_stage(stage_dir, name="", progress=None):
     stem = _sanitize(os.path.splitext(base)[0])
     if not stem:
         raise RuntimeError("模型名无效：%s" % base)
+
+    # 校验来源文件真的是模型，不是把音频/图片改个后缀塞进来。
+    # 这类文件扩展名对得上、但内容是音频，装进 models 后会出现在模型列表里，
+    # 一选中就报 onnx 解析失败 —— 必须挡在门口。
+    src_file = os.path.join(stage_dir, pth[0] if pth else onnx[0])
+    from .audio_io import sniff_audio
+    kind = sniff_audio(src_file)
+    if kind:
+        raise RuntimeError(
+            "这个文件其实是 %s 音频，不是音色模型。\n"
+            "音色模型是 .pth 或 .onnx 文件。如果你想转换这段音频，"
+            "请用「翻唱」上传音频，或到 models 目录之外存放。" % kind)
+
     dst_onnx = os.path.join(MODELS, stem + ".onnx")
     if os.path.exists(dst_onnx):
         raise RuntimeError("models 里已经有「%s」了。先把那个模型删掉，或者给这个模型换个名字" % stem)
@@ -404,6 +482,12 @@ def import_from_stage(stage_dir, name="", progress=None):
             _p(0.75, "复制特征索引…")
             shutil.copyfile(os.path.join(stage_dir, idx[0]),
                             os.path.join(MODELS, stem + ".index"))
+
+        # 真加载一次：扩展名对不代表内容对。
+        # 这里花 1~3 秒换来的是"装进去的模型一定能用"，不然用户要等到
+        # 点转换时才看到 onnx 解析失败，而且那时很难判断是模型的问题。
+        _p(0.84, "验证模型可用性…")
+        _verify_onnx(dst_onnx, stem)
 
         _p(0.9, "登记并切换…")
         reg = _load()
