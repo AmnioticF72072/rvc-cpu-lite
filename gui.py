@@ -33,6 +33,7 @@ VERSION = "Plus 1.2"
 sys.path.insert(0, ROOT)
 
 _lock = threading.Lock()
+_pipe_lock = threading.Lock()   # 保护管线重建（避免并发各建一份）
 _state = {
     "stage": "idle",          # idle | analyzing | separating | loading | running | importing | done | error
     "frac": 0.0,
@@ -132,33 +133,42 @@ def meta():
 
 
 def ensure_pipeline(index_rate=0.0, device="auto"):
-    """模型只加载一次；但设备变了必须重建 session，否则切换不生效。"""
+    """模型只加载一次；但设备变了必须重建 session，否则切换不生效。
+
+    用 _pipe_lock 保护重建路径：管线常驻约 1 GB，两个请求同时进来
+    各建一份，16G 机器直接贴着上限，很容易触发换页甚至 OOM。
+    """
     global _pipe, _pipe_device
     if _pipe is not None and _pipe_device == device:
         _pipe.index_rate = float(index_rate)
         return _pipe
-    if _pipe is not None:
-        try:
-            _pipe = None
-            import gc
-            gc.collect()
-        except Exception:
-            pass
-    gen, vec, rmv, idx = model_paths()
-    missing = [n for n, p in (("生成器", gen), ("ContentVec", vec), ("RMVPE", rmv)) if not p]
-    if missing:
-        raise RuntimeError("models 目录里缺少模型文件：%s。请整个文件夹一起解压，"
-                           "不要把 bat 单独拷出来。" % "、".join(missing))
-    set_state(stage="loading", frac=0.02, msg="正在加载模型（第一次要 10~30 秒）…")
-    log("加载模型，设备偏好：" + device)
-    from rvc_cpu.infer import RvcPipeline
-    _pipe = RvcPipeline(gen, vec, rmv, index_path=idx,
-                        index_rate=float(index_rate) if idx else 0.0,
-                        protect=0.10, verbose=True, device=device)
-    _pipe_device = device
-    set_state(model_ready=True, device_used=getattr(_pipe, "device_used", "CPU"))
-    log("模型就绪｜设备：" + getattr(_pipe, "device_used", "CPU")
-        + ("｜特征索引：" + os.path.basename(idx) if idx else ""))
+    with _pipe_lock:
+        # 等锁期间可能已经被别的线程建好了
+        if _pipe is not None and _pipe_device == device:
+            _pipe.index_rate = float(index_rate)
+            return _pipe
+        if _pipe is not None:
+            try:
+                _pipe = None
+                import gc
+                gc.collect()
+            except Exception:
+                pass
+        gen, vec, rmv, idx = model_paths()
+        missing = [n for n, p in (("生成器", gen), ("ContentVec", vec), ("RMVPE", rmv)) if not p]
+        if missing:
+            raise RuntimeError("models 目录里缺少模型文件：%s。请整个文件夹一起解压，"
+                               "不要把 bat 单独拷出来。" % "、".join(missing))
+        set_state(stage="loading", frac=0.02, msg="正在加载模型（第一次要 10~30 秒）…")
+        log("加载模型，设备偏好：" + device)
+        from rvc_cpu.infer import RvcPipeline
+        _pipe = RvcPipeline(gen, vec, rmv, index_path=idx,
+                            index_rate=float(index_rate) if idx else 0.0,
+                            protect=0.10, verbose=True, device=device)
+        _pipe_device = device
+        set_state(model_ready=True, device_used=getattr(_pipe, "device_used", "CPU"))
+        log("模型就绪｜设备：" + getattr(_pipe, "device_used", "CPU")
+            + ("｜特征索引：" + os.path.basename(idx) if idx else ""))
     return _pipe
 
 
@@ -194,15 +204,19 @@ def run_analyze(path):
 
 
 def run_job(files, key, index_rate, sep_mode, device="auto"):
-    """批量转换：逐个文件走 分离 → 转换，总进度按文件数摊分。"""
+    """批量转换：逐个文件走 分离 → 转换，总进度按文件数摊分。
+
+    单个文件失败只跳过它并记下来，不拖垮整批 —— 批量跑一专辑时，
+    一首坏文件把剩下九首全废掉是说不通的。
+    """
     global _abort
+    total = len(files)
+    outs = []
+    failures = []          # [(文件名, 失败原因)]
     try:
-        total = len(files)
-        outs = []
         for i, in_path in enumerate(files):
             if _abort:
                 raise RuntimeError("已取消")
-            # 每个文件占的进度区间
             span = 1.0 / total
             f0p = i * span
 
@@ -210,47 +224,70 @@ def run_job(files, key, index_rate, sep_mode, device="auto"):
                 set_state(frac=round(_b + _s * float(frac), 4),
                           msg=("[%d/%d] " % (_n, total)) + str(msg))
 
-            src = in_path
-            if sep_mode and sep_mode != "none":
-                from rvc_cpu import separate as sep
+            try:
+                src = in_path
+                if sep_mode and sep_mode != "none":
+                    from rvc_cpu import separate as sep
 
-                set_state(stage="separating", phase="分离",
-                          msg="正在分离和声/伴奏（这一步最慢，耐心等）…")
-                log("分离：%s（%s）" % (os.path.basename(in_path), sep_mode))
-                src = sep.run(sep_mode, in_path, os.path.join(WORK, "sep"),
-                              on_progress=lambda f, m, _sub=sub: _sub(0.05 + 0.4 * f, m))
-                log("分离得到：" + os.path.basename(src))
+                    set_state(stage="separating", phase="分离",
+                              msg="正在分离和声/伴奏（这一步最慢，耐心等）…")
+                    log("分离：%s（%s）" % (os.path.basename(in_path), sep_mode))
+                    src = sep.run(sep_mode, in_path, os.path.join(WORK, "sep"),
+                                  on_progress=lambda f, m, _sub=sub: _sub(0.05 + 0.4 * f, m))
+                    log("分离得到：" + os.path.basename(src))
 
-            pipe = ensure_pipeline(index_rate, device)
+                pipe = ensure_pipeline(index_rate, device)
 
-            def prog(frac, msg, _sub=sub, _sep=(sep_mode and sep_mode != "none")):
-                if _abort:
+                def prog(frac, msg, _sub=sub, _sep=(sep_mode and sep_mode != "none")):
+                    if _abort:
+                        raise RuntimeError("已取消")
+                    b = 0.5 if _sep else 0.05
+                    _sub(b + (0.95 - b) * float(frac), msg)
+
+                base = os.path.splitext(os.path.basename(in_path))[0]
+                base = re.sub(r"[\\/:*?\"<>|]", "_", base)[:60]
+                os.makedirs(OUT, exist_ok=True)
+                out_path = os.path.join(OUT, "%s_Plus.wav" % base)
+                n = 2
+                while os.path.isfile(out_path):
+                    out_path = os.path.join(OUT, "%s_Plus(%d).wav" % (base, n))
+                    n += 1
+
+                set_state(stage="running", phase="转换", error="",
+                          started_at=time.time())
+                log("转换：%s（移调 %+d，检索 %.2f，设备 %s）" %
+                    (os.path.basename(src), int(key), index_rate, device))
+                pipe.convert_file(src, out_path, f0_up_key=int(key), on_progress=prog)
+                outs.append(out_path)
+                log("完成：" + out_path)
+            except Exception as one:
+                m = str(one)
+                if "已取消" in m or _abort:
                     raise RuntimeError("已取消")
-                b = 0.5 if _sep else 0.05
-                _sub(b + (0.95 - b) * float(frac), msg)
+                failures.append((os.path.basename(in_path), m))
+                log("跳过「%s」：%s" % (os.path.basename(in_path), m))
+                continue
 
-            base = os.path.splitext(os.path.basename(in_path))[0]
-            base = re.sub(r"[\\/:*?\"<>|]", "_", base)[:60]
-            os.makedirs(OUT, exist_ok=True)
-            out_path = os.path.join(OUT, "%s_Plus.wav" % base)
-            n = 2
-            while os.path.isfile(out_path):
-                out_path = os.path.join(OUT, "%s_Plus(%d).wav" % (base, n))
-                n += 1
+        # ---- 汇总 ----
+        if not outs:
+            first = failures[0][1] if failures else "没有可转换的文件"
+            set_state(stage="error", frac=0, phase="", error=first, msg="全部失败")
+            log("全部失败：%s" % first)
+            return
 
-            set_state(stage="running", phase="转换", error="",
-                      started_at=time.time())
-            log("转换：%s（移调 %+d，检索 %.2f，设备 %s）" %
-                (os.path.basename(src), int(key), index_rate, device))
-            pipe.convert_file(src, out_path, f0_up_key=int(key), on_progress=prog)
-            outs.append(out_path)
-            log("完成：" + out_path)
-
-        last = outs[-1] if outs else ""
+        last = outs[-1]
+        if failures:
+            msg = "完成 %d 个，%d 个失败（详情见下方日志）" % (len(outs), len(failures))
+        elif len(outs) > 1:
+            msg = "全部完成（%d 个文件）" % len(outs)
+        else:
+            try:
+                sz = os.path.getsize(last) / 1024 ** 2
+            except OSError:
+                sz = 0.0
+            msg = "完成 · %s（%.1f MB）" % (os.path.basename(last), sz)
         set_state(stage="done", frac=1.0, output=last, phase="", outputs=outs,
-                  msg="全部完成（%d 个文件）" % len(outs) if len(outs) > 1
-                  else "完成 · %s（%.1f MB）" % (os.path.basename(last),
-                                                 os.path.getsize(last) / 1024 ** 2))
+                  msg=msg)
     except Exception as e:
         m = str(e)
         if "已取消" in m:
@@ -597,6 +634,7 @@ function setPicked(name){
   $('#fname').textContent = name || '—';
   $('#filebox').classList.toggle('on', !!name);
   $('#go').disabled = !name;
+  $('#btnAna').disabled = !name;
 }
 
 async function loadMeta(){
@@ -936,6 +974,26 @@ class Handler(BaseHTTPRequestHandler):
                     left -= len(buf)
             q = [x for x in (get_state().get("queue") or []) if os.path.isfile(x)]
             q.append(dst)
+
+            # 入库前先确认是能读的音频：否则要等到转换时才炸，
+            # 一个坏文件就能把整批队列拖垮（提示也很晚）。
+            try:
+                import soundfile as _sf
+                _info = _sf.info(dst)
+                if not _info.frames or _info.samplerate <= 0:
+                    raise ValueError("音频是空的")
+            except Exception as _e:
+                try:
+                    q.remove(dst)
+                    os.remove(dst)
+                except Exception:
+                    pass
+                return self._json({"ok": False,
+                                   "error": "不是能识别的音频文件（%s）。"
+                                            "支持 wav / flac / ogg / aiff / mp3，"
+                                            "m4a 请先转成 wav"
+                                            % str(_e).split(":")[-1].strip()[:60]})
+
             set_state(input=dst, queue=q, output="", error="", analysis=None,
                       outputs=[])
             return self._json({"ok": True, "name": safe, "count": len(q)})
@@ -1042,7 +1100,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True})
 
         if u.path == "/api/model/select":
-            nm = str(payload.get("name") or "").strip()
+            # 参数优先取 JSON body，其次取 query（两种写法都接受，方便脚本调用）
+            nm = str(payload.get("name")
+                     or parse_qs(u.query).get("name", [""])[0] or "").strip()
             try:
                 from rvc_cpu import models as mm
                 r = mm.set_active(nm)
@@ -1053,7 +1113,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": str(e)})
 
         if u.path == "/api/model/delete":
-            nm = str(payload.get("name") or "").strip()
+            nm = str(payload.get("name")
+                     or parse_qs(u.query).get("name", [""])[0] or "").strip()
             try:
                 from rvc_cpu import models as mm
                 r = mm.delete_model(nm)

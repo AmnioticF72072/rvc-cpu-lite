@@ -127,8 +127,11 @@ def suggest(stats, profile=None):
     return {"key": int(key), "reason": reason, "shifted": shifted, "profile": prof}
 
 
-def analyze_file(rmvpe_path, wav_path, progress=None):
-    """独立分析一个音频文件的音高分布（只加载 RMVPE，比加载整套快得多）。"""
+def analyze_file(rmvpe_path, wav_path, progress=None, return_f0=False):
+    """独立分析一个音频文件的音高分布（只加载 RMVPE，比加载整套快得多）。
+
+    return_f0=True 时返回 (stats, f0逐帧数组)，给 Ultra Lite 的分段曲线用。
+    """
     import soundfile as sf
     import soxr
 
@@ -150,4 +153,7 @@ def analyze_file(rmvpe_path, wav_path, progress=None):
     model = RMVPE(rmvpe_path)
     f0 = model.infer_from_audio(audio.astype(np.float32), thred=0.03)
     _p(0.9, "统计…")
-    return stats_from_f0(f0)
+    stats = stats_from_f0(f0)
+    if return_f0:
+        return stats, f0
+    return stats

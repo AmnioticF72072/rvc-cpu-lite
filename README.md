@@ -177,6 +177,7 @@ gui.py                Plus 图形界面（本机网页，双击 启动界面(Plu
 rvc_cpu/
   infer.py            主流水线：分块、f0、特征、protect 混合、RMS 对齐
   models.py           音色模型库：导入 / 切换 / 删除 / 注册表（Plus 1.2）
+  ultra_lite.py       分段音高曲线 / 转换后质检 / 频谱匹配 EQ（独立模块，界面还没接）
   calibrate.py        自动定档：测音高、算偶数半音移调
   separate.py         分离调度（去和声 / 分人声，交给带 torch 的子进程）
   hw_profile.py       硬件探测，按 CPU 型号给线程数和后端
