@@ -39,20 +39,35 @@ from app.core import (VERSION, ensure_pipeline, get_state, log,      # noqa: E40
 _lock = _core._lock
 _abort = False
 _meta_cache = None      # gui 自己的 meta 缓存（字段名与 app.core 不同，不能共用）
+_meta_cache_at = 0.0
 
 
 def invalidate():                                              # noqa: F811
     """兼容旧调用点：模型变了要同时丢掉管线与音高分析。"""
-    global _meta_cache
+    global _meta_cache, _meta_cache_at
     _meta_cache = None
+    _meta_cache_at = 0.0
     _core.invalidate()
 
 
 # ---------------------------------------------------------------- 资源发现
+def _has_faiss():
+    try:
+        from rvc_cpu import has_index_backend
+        return bool(has_index_backend())
+    except Exception:
+        return False
+
+
 def meta():
-    """给界面用的资源清单（缓存一次，避免每次轮询都扫盘）。"""
-    global _meta_cache
-    if _meta_cache is not None:
+    """给界面用的资源清单。
+
+    缓存 3 秒——纯粹为了挡住轮询的重复扫盘。不设更长是因为：
+    用户可能自己往 models 目录里放模型文件（不走导入流程），
+    缓存太久会导致"文件明明放进去了，列表里没有"。
+    """
+    global _meta_cache, _meta_cache_at
+    if _meta_cache is not None and (time.time() - _meta_cache_at) < 3.0:
         return _meta_cache
     from rvc_cpu import models as mm
     gen, vec, rmv, idx = model_paths()
@@ -72,6 +87,9 @@ def meta():
     _meta_cache = {
         "version": VERSION,
         "active_model": active,
+        # 特征检索后端（faiss）是否可用 —— 这个不做的话 index_rate 完全无效，
+        # 而 index 正是决定"像不像目标角色"的头号因素，必须让用户看见
+        "index_backend": _has_faiss(),
         "model_list": models,
         "models": {
             "gen": os.path.basename(gen) if gen else "",
@@ -88,6 +106,7 @@ def meta():
             "backends": probe["backends"],
         },
     }
+    _meta_cache_at = time.time()
     return _meta_cache
 
 
@@ -727,7 +746,7 @@ PAGE = r"""<!doctype html>
       <div class="card">
         <div class="step"><div class="num">4</div><h2>念成谁的声音</h2>
           <span class="opt">音色由模型决定</span></div>
-        <p class="hint">用上面「音色模型」里选中的模型。移调建议留自动，程序会按载体音高自己算。</p>
+        <p class="hint">用上面「音色模型」里选中的模型。要像某个角色说话，就导入那个角色的模型。</p>
         <div class="row">
           <div class="keyval" id="rdKeyVal">自动<small>移调</small></div>
           <label class="rdauto"><input type="checkbox" id="rdKeyAuto" checked>
@@ -735,6 +754,16 @@ PAGE = r"""<!doctype html>
         </div>
         <input type="range" id="rdKey" min="-12" max="12" step="1" value="0" disabled>
         <div class="keyscale"><span>-12 低</span><span>0</span><span>+12 高</span></div>
+
+        <div style="margin-top:18px;padding-top:16px;border-top:1px solid rgba(10,132,255,.1)">
+          <div class="row">
+            <div class="keyval" id="rdIdxVal">0.75<small>贴合度</small></div>
+            <span id="rdIdxHint" style="font-size:12px;color:#7a8899;text-align:right">
+              有 .index 才生效</span>
+          </div>
+          <input type="range" id="rdIdx" min="0" max="100" step="5" value="75">
+          <div class="keyscale"><span>0 像载体的音</span><span>0.75 推荐</span><span>1.0 最贴模型</span></div>
+        </div>
       </div>
 
       <div class="card">
@@ -802,6 +831,7 @@ function setPicked(name){
 
 async function loadMeta(){
   meta = await (await fetch('/api/meta')).json();
+  _hasIdxBackend = (meta.index_backend !== false);
   renderModels(meta);
   const s = meta.sep || {};
   const parts = [];
@@ -886,6 +916,8 @@ function renderModels(m){
   if (cur.imported_at) bits.push(cur.imported_at.slice(5, 10) + ' 导入');
   $('#modelInfo').textContent = bits.join(' · ');
   $('#btnDelModel').style.display = list.length > 1 ? 'inline-flex' : 'none';
+  // 朗读页的贴合度滑块：模型没 .index 就没意义，直接禁用并说明
+  try{ rdIdxAvail(!!(cur && cur.index)); }catch(e){}
   box.querySelectorAll('input[name=mdl]').forEach(r => {
     r.onchange = async () => {
       if (r.value === (meta.active_model || '')) return;
@@ -937,6 +969,7 @@ $('#btnDelModel').onclick = async () => {
     headers:{'Content-Type':'application/json'}, body: JSON.stringify({name:cur})})).json();
   if (j.ok){
     meta = await (await fetch('/api/meta')).json();
+    _hasIdxBackend = (meta.index_backend !== false);
     renderModels(meta);
     $('#pmsg').textContent = '已删除「' + cur + '」';
   } else $('#pmsg').textContent = '删除失败：' + j.error;
@@ -1169,7 +1202,9 @@ $('#rdGo').onclick = async () => {
     emotion: emo,
     voice: $('#rdVoice').value || null,
     key: $('#rdKeyAuto').checked ? null : +$('#rdKey').value,
-    index_rate: +($('#idxrate').value || 50) / 100
+    // 用朗读页自己的贴合度，不再借用翻唱页的滑块 ——
+    // 之前如果翻唱页设成 0，朗读的音色就完全不贴，还查不出原因
+    index_rate: +($('#rdIdx').value || 75) / 100
   };
   try{
     const j = await (await fetch('/api/read', {method: 'POST',
@@ -1190,6 +1225,35 @@ $('#rdGo').onclick = async () => {
 $('#rdReveal').onclick = async () => {
   await fetch('/api/reveal', {method: 'POST'});
 };
+
+// 音色贴合度滑块
+$('#rdIdx').addEventListener('input', e => {
+  const v = +e.target.value / 100;
+  $('#rdIdxVal').innerHTML = v.toFixed(2) + '<small>贴合度</small>';
+  $('#rdIdxHint').textContent = v === 0 ? '只靠模型本身'
+    : (v >= 0.9 ? '最贴，可能有金属感' : (v >= 0.6 ? '推荐范围' : '偏松'));
+  try{ localStorage.setItem('rvc_read_idx', String(e.target.value)); }catch(err){}
+});
+// 有 .index 才谈得上"贴合度"，没有就说明白。
+// 还要区分两种情况：模型没带 .index， vs 程序缺 faiss 后端（那有 .index 也用不了）
+let _hasIdxBackend = true;
+function rdIdxAvail(hasIndex){
+  const s = $('#rdIdx');
+  if (!_hasIdxBackend){
+    s.disabled = true;
+    $('#rdIdxHint').innerHTML =
+      '<span style="color:#c9434f">特征检索组件缺失，贴合度不起作用</span>';
+    return;
+  }
+  if (hasIndex){
+    s.disabled = false;
+    $('#rdIdxHint').textContent = '有索引，音色调这里';
+  } else {
+    s.disabled = true;
+    $('#rdIdxHint').innerHTML =
+      '<span style="color:#d98a2b">当前模型没有 .index，音色只能靠模型本身</span>';
+  }
+}
 
 function rdRender(s){
   // 进度与提示（朗读进行中由 poll 调用）
@@ -1356,6 +1420,13 @@ loadMeta().then(() => {
     if (m === 'read') setMode('read');
   }catch(e){}
   rdStats();
+  try{
+    const v = localStorage.getItem('rvc_read_idx');
+    if (v !== null){
+      $('#rdIdx').value = v;
+      $('#rdIdxVal').innerHTML = (+v/100).toFixed(2) + '<small>贴合度</small>';
+    }
+  }catch(e){}
   poll();
 });
 </script></body></html>

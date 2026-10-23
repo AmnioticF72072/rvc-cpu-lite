@@ -118,7 +118,7 @@ def meta():
     }
 
 
-VERSION = "Plus 2.0"
+VERSION = "Plus 2.0.2"
 
 
 # ---------------------------------------------------------------- 管线
@@ -135,24 +135,40 @@ def invalidate():
     set_state(analysis=None)
 
 
-def ensure_pipeline(index_rate=0.0, device="auto"):
+def ensure_pipeline(index_rate=0.0, device="auto", protect=None,
+                    rms_mix_rate=None):
     """按「模型 + 设备」两个条件复用管线。
 
     以前只判设备 —— 只要设备没变就直接复用旧管线。这意味着切换模型后，
     如果哪条路径没走到 invalidate()，就会继续用上一个模型，而界面上显示的
     已经是新模型了（"选了却不生效"）。现在把模型名也纳入判断，
     哪怕漏了 invalidate 也不会串模型。
+
+    protect / rms_mix_rate：翻唱和朗读要的值不一样。
+      · 唱歌（protect 0.10）：要保住音色变化，少保护
+      · 说话（protect 0.33）：咬字和喘气要清楚，多保护
+    这两个值不同就重建管线（或就地更新，因为不影响 session 结构）。
     """
     global _pipe, _pipe_device, _pipe_model
     from rvc_cpu import models as mm
     want = mm.active_name() or ""
 
     if _pipe is not None and _pipe_device == device and _pipe_model == want:
-        _pipe.index_rate = float(index_rate)
+        # ensure_index：如果第一次是按 0 加载的（索引没读进内存），
+        # 现在要 0.75，必须补加载，否则检索被静默跳过
+        _pipe.ensure_index(float(index_rate))
+        if protect is not None:
+            _pipe.protect = float(protect)
+        if rms_mix_rate is not None:
+            _pipe.rms_mix_rate = float(rms_mix_rate)
         return _pipe
     with _pipe_lock:
         if _pipe is not None and _pipe_device == device and _pipe_model == want:
-            _pipe.index_rate = float(index_rate)
+            _pipe.ensure_index(float(index_rate))
+            if protect is not None:
+                _pipe.protect = float(protect)
+            if rms_mix_rate is not None:
+                _pipe.rms_mix_rate = float(rms_mix_rate)
             return _pipe
         if _pipe is not None:
             log("模型有变化，重新加载：" + (want or "?"))
@@ -174,7 +190,10 @@ def ensure_pipeline(index_rate=0.0, device="auto"):
         from rvc_cpu.infer import RvcPipeline
         _pipe = RvcPipeline(gen, vec, rmv, index_path=idx,
                             index_rate=float(index_rate) if idx else 0.0,
-                            protect=0.10, verbose=True, device=device)
+                            protect=float(protect) if protect is not None else 0.10,
+                            rms_mix_rate=(float(rms_mix_rate)
+                                          if rms_mix_rate is not None else 0.40),
+                            verbose=True, device=device)
         _pipe_device = device
         _pipe_model = want
         set_state(model_ready=True,

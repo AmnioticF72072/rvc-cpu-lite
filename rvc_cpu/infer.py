@@ -196,6 +196,7 @@ class RvcPipeline:
         self.protect = protect
         self.index = None
         self.index_rate = 0.0
+        self._index_path = index_path or ""   # ensure_index() 按需加载时要用
 
         # --- 生成器 ---
         if p["engine"] == "openvino":
@@ -349,6 +350,42 @@ class RvcPipeline:
         return feats.astype(np.float32)
 
     # ---- index 检索（可选）----
+    def ensure_index(self, rate):
+        """按需加载 / 更新特征检索。
+
+        为什么要单独一个方法：构造时如果 index_rate=0，索引根本不会加载
+        （省内存）。但翻唱用 0.5、朗读用 0.75，同一进程里切换时如果只改
+        self.index_rate，self.index 仍然是 None，检索就被静默跳过 ——
+        表现是"参数调了但音色没变"。这里在需要时补加载。
+        """
+        self.index_rate = float(rate)
+        if self.index_rate <= 0 or self.index is not None:
+            return self.index is not None
+        idx_path = getattr(self, "_index_path", "")
+        if not idx_path or not os.path.isfile(idx_path):
+            return False
+        try:
+            import faiss
+            self.index = faiss.read_index(idx_path)
+            try:
+                if hasattr(self.index, "make_direct_map"):
+                    self.index.make_direct_map()
+            except Exception:
+                pass
+            try:
+                self.index.nprobe = int(os.environ.get("RVC_NPROBE", "8"))
+            except Exception:
+                pass
+            if self.verbose:
+                print("[加载] 特征索引（按需）%s（%d 条）"
+                      % (os.path.basename(idx_path),
+                         getattr(self.index, "ntotal", 0)))
+            return True
+        except Exception as e:
+            print("[警告] index 加载失败，跳过检索: %s" % e)
+            self.index = None
+            return False
+
     def _index_search(self, feats, p_len):
         if self.index is None or self.index_rate <= 0:
             return feats

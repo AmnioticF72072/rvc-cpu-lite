@@ -6,6 +6,17 @@
   朗读：文字 → TTS 载体 → 变声
 
 所以两者共用同一个管线、同一个状态机、同一套质检，只有取输入那一步不同。
+
+**朗读的参数跟翻唱不一样，这不是随便调的**：
+
+| 参数 | 唱歌 | 说话 | 为什么 |
+|---|---|---|---|
+| index_rate | 0.5 | **0.75** | 说话音色要贴，越靠训练集越像本人 |
+| protect | 0.10 | **0.33** | 唱歌少保护以保住音色变化；说话要多保护，否则咬字糊、喘气变噪音 |
+| rms_mix_rate | 0.40 | **0.25** | 说话音量本身平稳，跟源太多会把载体的机械起伏带进来 |
+
+RVC 官方 pipeline 的默认 protect 就是 0.33（面向说话/朗读），
+0.10 是社区为唱歌调低的。之前朗读错误地继承了唱歌的 0.10。
 """
 from __future__ import annotations
 
@@ -14,15 +25,23 @@ import traceback
 
 from .core import OUT, WORK, ensure_pipeline, get_state, log, set_state
 
+# 说话场景的默认参数（翻唱那边是 0.5 / 0.10 / 0.40）
+READ_INDEX = 0.75
+READ_PROTECT = 0.33
+READ_RMS = 0.25
+
 
 def run_read(text, emotion="neutral", voice_id=None, key=None,
-             index_rate=0.5, device="auto"):
+             index_rate=None, device="auto"):
     """跑一次朗读。异常统一落到 state.error，不往上抛（后台线程里抛也没人接）。"""
     try:
+        rate = READ_INDEX if index_rate is None else float(index_rate)
         set_state(stage="reading", frac=0.01, phase="朗读", error="",
                   output="", qa=None, read=None, started_at=__import__("time").time(),
                   msg="正在把文字读成音节…")
-        pipe = ensure_pipeline(index_rate, device)
+        # 说话专用参数：protect/rms 跟翻唱不同
+        pipe = ensure_pipeline(rate, device, protect=READ_PROTECT,
+                               rms_mix_rate=READ_RMS)
 
         from rvc_cpu.read import read_text
         os.makedirs(OUT, exist_ok=True)
