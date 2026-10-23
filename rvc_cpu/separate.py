@@ -1,87 +1,82 @@
 # -*- coding: utf-8 -*-
-"""分离（去和声 / 分人声）的调度层。
+"""分离调度（对外唯一入口）。
 
-CPU 版本体不装 torch，所以这一步交给"装了 torch 的 python"以子进程方式跑
-（tools/sep_worker.py）。找不到就明确告诉用户缺什么，不静默失败。
+2.1 起这里只做调度，真正的能力在 rvc_cpu/sep/ 里：
+    sep/worker.py        选解释器、设环境变量（内置 torch / 外部 Python）
+    sep/karaoke.py       找 UVR 去和声模型
+    tools/sep_worker.py  子进程里的实际执行
+
+对外接口保持兼容：probe() / run() / LAST_ACCOMP。
 """
 from __future__ import annotations
 
-import glob
 import json
 import os
 import subprocess
-import sys
+
+from .sep import karaoke as _karaoke
+from .sep import worker as _worker
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKER = os.path.join(ROOT, "tools", "sep_worker.py")
 
-# 可能装了 torch 的 python，按优先级（都相对仓库位置，不写死作者本机路径）
-PY_CANDIDATES = [
-    os.path.join(ROOT, ".venv", "Scripts", "python.exe"),
-    os.path.join(ROOT, "..", "env", "rvc", "Scripts", "python.exe"),
-    os.path.join(ROOT, "..", "..", "env", "rvc", "Scripts", "python.exe"),
-]
-
-
-def _has_module(py, mod):
-    """不真的 import（torch 太慢），直接看 site-packages 里有没有目录。"""
-    if not os.path.isfile(py):
-        return False
-    base = os.path.dirname(os.path.dirname(py))          # 去掉 Scripts\python.exe
-    for sp in (os.path.join(base, "Lib", "site-packages"),
-               os.path.join(base, "lib", "python3.10", "site-packages")):
-        if not os.path.isdir(sp):
-            continue
-        if glob.glob(os.path.join(sp, mod + "*")):
-            return True
-    return False
+LAST_ACCOMP = ""      # 最近一次分离产出的伴奏轨（vocals 模式才有）
 
 
 def probe():
-    """返回 {python, backends, karaoke_models, ready_karaoke, ready_vocals}"""
-    info = {"python": "", "backends": [], "karaoke_models": [], "dirs": []}
-    for py in PY_CANDIDATES:
-        if not os.path.isfile(py):
-            continue
-        mods = [m for m in ("demucs", "audio_separator") if _has_module(py, m)]
-        if mods:
-            info["python"] = py
-            info["backends"] = mods
-            break
-    # Karaoke 模型候选：models\sep 优先，其次各种缓存
-    dirs = [os.path.join(ROOT, "models", "sep"),
-            os.path.expanduser("~/.cache/audio_separator"),
-            os.path.expanduser("~/.cache/audio_separator/models"),
-            os.path.expanduser("~/.cache/torch/hub/checkpoints")]
-    info["dirs"] = [d for d in dirs if os.path.isdir(d)]
-    for d in info["dirs"]:
-        for p in glob.glob(os.path.join(d, "**", "*"), recursive=True):
-            b = os.path.basename(p).lower()
-            if os.path.isfile(p) and "karaoke" in b and b.endswith((".pth", ".onnx")):
-                info["karaoke_models"].append(p)
-    info["ready_karaoke"] = bool(info["python"] and info["karaoke_models"])
-    info["ready_vocals"] = bool(info["python"])
+    """返回分离能力清单（界面据此显示"能不能用/缺什么"）。"""
+    py = _worker.worker_python()
+    info = {
+        "python": py,
+        "bundled": _worker.bundled_torch(),
+        "backends": [],
+        "karaoke_models": [],
+        "ready_karaoke": False,
+        "ready_vocals": False,
+        "dirs": [],
+    }
+    if py:
+        info["backends"].append("demucs")
+        info["ready_vocals"] = True
+    m = _karaoke.find_model()
+    if m:
+        info["karaoke_models"].append(m)
+        info["ready_karaoke"] = bool(py and _karaoke.has_separator_backend())
     return info
 
 
-LAST_ACCOMP = ""      # 最近一次分离产出的伴奏轨（vocals 模式才有）
+def describe():
+    """给界面用的一句话说明。"""
+    p = probe()
+    if p["bundled"]:
+        who = "内置分离引擎"
+    elif p["python"]:
+        who = "外部 Python"
+    else:
+        who = ""
+    return {
+        "vocals": p["ready_vocals"],
+        "karaoke": p["ready_karaoke"],
+        "engine": who,
+        "model": os.path.basename(p["karaoke_models"][0]) if p["karaoke_models"] else "",
+    }
 
 
 def run(mode, in_path, out_dir, on_progress=None, model=""):
     """跑分离。mode: karaoke | vocals。返回人声文件路径。
 
     vocals 模式会把伴奏轨记在模块变量 LAST_ACCOMP —— 上层用它做合轨。
-    用模块变量而不是改返回值，是为了不破坏现有调用方（run 的返回值
-    一直是"人声路径"，很多地方按这个约定在用）。
     """
     global LAST_ACCOMP
     LAST_ACCOMP = ""
-    info = probe()
-    py = info["python"]
+
+    py = _worker.worker_python()
     if not py:
         raise RuntimeError(
-            "这台机器没有分离后端（需要 audio-separator 或 demucs + torch）。\n"
-            "只做变声、不去和声的话，把「先去和声」选成「不做」就能继续用。")
+            "没有可用的分离后端。\n"
+            "这个安装包本应自带分离引擎（runtime\\_sep_libs）。"
+            "如果缺失说明压缩包不完整，请重新完整解压。\n"
+            "只想变声、不做分离的话，把「先去和声」选成「不做」也能正常用。")
 
     def emit(frac, msg):
         if on_progress:
@@ -91,20 +86,24 @@ def run(mode, in_path, out_dir, on_progress=None, model=""):
                 pass
 
     os.makedirs(out_dir, exist_ok=True)
-    if mode == "karaoke" and not model and info["karaoke_models"]:
-        model = info["karaoke_models"][0]      # 探测到的模型直接传给 worker
+    if mode == "karaoke" and not model:
+        model = _karaoke.find_model()
+        if model and not _karaoke.has_separator_backend():
+            raise RuntimeError(
+                "找到去和声模型「%s」，但缺少 audio-separator 组件。\n"
+                "改用「分人声」模式可以去掉伴奏（内置引擎，不需要额外组件）。"
+                % os.path.basename(model))
+
     cmd = [py, WORKER, "--in", in_path, "--out", out_dir, "--mode", mode]
     if model:
         cmd += ["--model", model]
 
-    env = dict(os.environ)
-    env.pop("PYTHONPATH", None)          # 沙箱注入的 shim 会污染子进程
-    env["PYTHONIOENCODING"] = "utf-8"
-    env.setdefault("HF_HOME", os.path.expanduser("~/.cache"))
-
+    env = _worker.build_env()
     emit(0.02, "启动分离进程…")
+
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, encoding="utf-8", errors="ignore", env=env, bufsize=1)
+                         text=True, encoding="utf-8", errors="ignore",
+                         env=env, bufsize=1, cwd=ROOT)
     out_path, err, last = "", "", ""
     for line in p.stdout:
         line = line.strip()
@@ -135,8 +134,8 @@ def run(mode, in_path, out_dir, on_progress=None, model=""):
     if p.returncode != 0 or not out_path or not os.path.isfile(out_path):
         if p.returncode == 2:
             raise RuntimeError(
-                "没有 Karaoke 分离模型。\n"
-                "把 5_HP-Karaoke-UVR.pth 放到 models\\sep\\ 里就能用；\n"
-                "或者把「先去和声」改成「只分人声和伴奏」（用 demucs，不需要额外模型）。")
+                "没有可用的去和声模型。\n"
+                "把 5_HP-Karaoke-UVR.pth 放到 models\\sep\\ 里；\n"
+                "或者把「先去和声」改成「分人声」——内置引擎就能去掉伴奏。")
         raise RuntimeError(err or ("分离进程失败（退出码 %s）%s" % (p.returncode, last)))
     return out_path

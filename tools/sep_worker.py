@@ -14,6 +14,8 @@ import glob
 import json
 import os
 import sys
+
+import numpy as np
 import time
 
 
@@ -73,42 +75,91 @@ def run_demucs(in_path, out_dir):
     串音显著下降，代价是耗时约 3 倍 —— 对 CPU 用户是笔值得的交换，
     因为分离不干净的后果是"整首翻唱都带着别人的声音"，不能忍。
 
-    shifts=1 保持默认：提高它会成倍增加耗时，收益远小于 overlap。
-    cpu 上再叠加 shifts 会让 4 分钟歌从 3 分钟变成十几分钟，不划算。
+    **为什么用 API 而不是 `python -m demucs`**：
+    起子进程时要把 PYTHONPATH 清掉（防沙箱注入的 sitecustomize shim），
+    但清了之后子进程就找不到包内的 torch/demucs（在 runtime\\_sep_libs 里），
+    于是报 "No module named demucs" —— 而且这个错会被上层误判成
+    "没有分离后端"。本进程已经是子进程了，直接调 API 最稳：
+    不重复加载模型，还能拿到逐段的进度回调。
     """
-    import subprocess
     import os as _os
-    overlap = _os.environ.get("SEP_OVERLAP", "0.75")
-    cmd = [sys.executable, "-m", "demucs", "-n", "htdemucs", "--two-stems=vocals",
-           "--overlap", str(overlap), "-o", out_dir, in_path]
-    if _os.environ.get("SEP_DEVICE"):
-        cmd[3:3] = ["-d", _os.environ["SEP_DEVICE"]]
-    env = dict(_os.environ)
-    env.setdefault("HF_HOME", _os.path.join(_os.path.expanduser("~"), ".cache"))
-    env.pop("PYTHONPATH", None)
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, encoding="utf-8", errors="ignore", env=env)
-    buf = []
-    for line in p.stdout:
-        line = line.rstrip()
-        if not line:
-            continue
-        buf.append(line)
-        if len(buf) > 40:
-            del buf[:20]
-        if "%" in line:
-            emit(stage="separating", frac=0.5, msg="正在分离：" + line.strip()[:60])
-    p.wait()
-    stem = _os.path.splitext(_os.path.basename(in_path))[0]
-    cand = _os.path.join(out_dir, "htdemucs", stem, "vocals.wav")
-    if not _os.path.isfile(cand):
-        for root, _d, fs in _os.walk(out_dir):
-            for f in fs:
-                if f == "vocals.wav":
-                    cand = _os.path.join(root, f)
-    if p.returncode != 0 or not _os.path.isfile(cand):
-        raise RuntimeError("demucs 失败：" + "\n".join(buf[-6:]))
-    return cand
+
+    # 低端双核（赛扬/奔腾/Atom）上，overlap 0.75 会让分离慢到不可接受
+    # （双核按 4 倍耗时算，4 分钟的歌要一个多小时）。
+    # 自动降档换取可用性 —— 宁可分离稍差也要能等到结果。
+    # 实测（8 秒素材，i5-10400 6 线程）：
+    #   overlap 0.25 → 27.7 秒   0.50 → 33.3 秒   0.75 → 52.4 秒
+    # 0.75 的质量收益抵不上多花一倍时间，0.5 是折中点。
+    default_ov = 0.5
+    threads = max(1, (_os.cpu_count() or 4))
+    try:
+        import sys as _sys
+        _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        if _root not in _sys.path:
+            _sys.path.insert(0, _root)
+        from rvc_cpu.hw_profile import is_lowend_cpu, pick_profile
+        _p = pick_profile()
+        threads = max(1, int(_p.get("intra_threads") or threads))
+        if is_lowend_cpu():
+            default_ov = 0.30
+            emit(stage="warn", frac=0.05,
+                 msg="检测到低端双核（%s），已自动降低分离精度以缩短等待时间"
+                     % _p.get("cpu", "")[:40])
+    except Exception:
+        pass
+    overlap = float(_os.environ.get("SEP_OVERLAP", default_ov))
+
+    import torch
+    from demucs.api import Separator
+
+    torch.set_num_threads(max(1, threads))
+    emit(stage="separating", frac=0.12,
+         msg="加载分离模型（%d 线程，重叠 %.2f）…" % (threads, overlap))
+
+    sep = Separator(model="htdemucs", device="cpu", progress=False,
+                    overlap=overlap, shifts=1, split=True)
+    emit(stage="separating", frac=0.2, msg="正在分离人声与伴奏…（这一步最慢）")
+
+    # ★ 自己读音频，不用 sep.separate_audio_file()。
+    #   后者内部走 sphn（Rust 实现），实测在**中文路径 / 相对路径**上会报
+    #   'When trying to load using sphn, got the following error'。
+    #   而本程序的安装目录名就叫「声音转换Plus」，必然踩到。
+    #   soundfile 没有这个问题（它走 libsndfile，路径当普通字符串处理）。
+    import soundfile as _sf
+    import soxr as _soxr
+    _x, _sr = _sf.read(os.path.abspath(in_path), dtype="float32", always_2d=True)
+    if _sr != sep.samplerate:
+        _x = np.stack([_soxr.resample(_x[:, c], _sr, sep.samplerate, quality="HQ")
+                       for c in range(_x.shape[1])], 1)
+    # demucs 要单声道直接复制成两声道（它内部按立体声模型处理）
+    if _x.shape[1] == 1:
+        _x = np.repeat(_x, 2, axis=1)
+    wav = torch.from_numpy(np.ascontiguousarray(_x.T))   # (channels, samples)
+
+    origin, parts = sep.separate_tensor(wav, sr=sep.samplerate)
+
+    # 人声 = vocals；伴奏 = 其余所有声部相加
+    # （不用 --two-stems：直接拿 4 个声部再合并，质量一样且更可控）
+    vocals = parts["vocals"]
+    others = [_v for k, _v in parts.items() if k != "vocals"]
+    accomp = others[0].clone()
+    for o in others[1:]:
+        accomp = accomp + o
+
+    os.makedirs(out_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(in_path))[0]
+    vdir = os.path.join(out_dir, "htdemucs", stem)
+    os.makedirs(vdir, exist_ok=True)
+
+    import soundfile as sf
+    sr = sep.samplerate
+    vpath = os.path.join(vdir, "vocals.wav")
+    apath = os.path.join(vdir, "no_vocals.wav")
+    # demucs 给的是 (channels, samples) 的 tensor
+    sf.write(vpath, vocals.detach().cpu().numpy().T, sr, subtype="PCM_24")
+    sf.write(apath, accomp.detach().cpu().numpy().T, sr, subtype="PCM_24")
+    emit(stage="separating", frac=0.95, msg="分离完成，正在写出文件…")
+    return vpath
 
 
 def find_accompaniment(sep_out_dir, in_path):
@@ -117,7 +168,8 @@ def find_accompaniment(sep_out_dir, in_path):
     返回伴奏路径或空串。上层用它做"换完人声再合回去"——
     这才是翻唱的标准流程：伴奏必须保留原样，只换主唱。
     """
-    stem = _os.path.splitext(_os.path.basename(in_path))[0]
+    import os as _os
+    stem = os.path.splitext(os.path.basename(in_path))[0]
     cand = _os.path.join(sep_out_dir, "htdemucs", stem, "no_vocals.wav")
     if _os.path.isfile(cand):
         return cand

@@ -80,6 +80,8 @@ def meta():
     from rvc_cpu import models as mm
     gen, vec, rmv, idx = model_paths()
     from rvc_cpu import separate as sep
+    from rvc_cpu.hw_profile import pick_profile as _pp
+    _hw = _pp()
     probe = sep.probe()
     index_info = None
     if idx:
@@ -114,6 +116,20 @@ def meta():
             "backend": os.path.basename(os.path.dirname(os.path.dirname(probe["python"])))
             if probe["python"] else "",
             "backends": probe["backends"],
+            # 是不是内置引擎：界面要明确告诉用户"不用另外装东西"
+            "bundled": probe.get("bundled", False),
+            "engine": "内置分离引擎" if probe.get("bundled") else "",
+        },
+        # 机器能力：低端机要提前告知，不能让用户干等半小时还以为卡死了
+        "hw": {
+            "cpu": _hw.get("cpu", ""),
+            "logical": _hw.get("logical", 0),
+            "threads": _hw.get("intra_threads", 0),
+            "profile": _hw.get("profile", ""),
+            "lowend": bool(_hw.get("lowend")),
+            "avx2_risk": _hw.get("avx2_risk", ""),
+            "avx2_note": _hw.get("avx2_note", ""),
+            "speed_note": _hw.get("speed_note", ""),
         },
     }
     _meta_cache_at = time.time()
@@ -474,6 +490,42 @@ PAGE = r"""<!doctype html>
   .out code{display:block;font-size:11.6px;color:#4c5c72;word-break:break-all;margin:6px 0 10px;
     font-family:ui-monospace,Consolas,monospace}
 
+  /* ---------- 自定义播放器 ----------
+     浏览器原生 <audio> 在这个卡片布局里只有一条细线，很多人根本看不出
+     那是能点的播放器，以为只有"打开文件夹"。所以自绘一套：
+     波形可点跳转、大播放键、时间、音量、循环、下载。 */
+  .pl{margin:12px 0 4px;padding:14px 15px 12px;border-radius:15px;
+    background:linear-gradient(180deg,#FFFFFF,#F7FAFF);
+    border:1px solid #DCE6F3;
+    box-shadow:0 2px 4px rgba(16,38,72,.05),0 16px 34px -20px rgba(16,38,72,.22)}
+  .pl-main{display:flex;align-items:center;gap:14px}
+  .pl-btn{flex:none;width:52px;height:52px;border-radius:50%;border:none;cursor:pointer;
+    background:linear-gradient(150deg,#0B63F6,#4E9BFF);color:#fff;
+    display:grid;place-items:center;transition:transform .15s,box-shadow .15s;
+    box-shadow:0 6px 16px rgba(11,99,246,.32)}
+  .pl-btn:hover{transform:translateY(-1px);box-shadow:0 9px 22px rgba(11,99,246,.4)}
+  .pl-btn:active{transform:scale(.96)}
+  .pl-btn svg{width:21px;height:21px;fill:#fff}
+  .pl-btn.playing{background:linear-gradient(150deg,#0E9E6E,#38C795);
+    box-shadow:0 6px 16px rgba(14,158,110,.3)}
+  .pl-wave{flex:1;min-width:0;position:relative;height:56px;cursor:pointer;
+    display:block;width:100%;border-radius:10px}
+  .pl-wave:hover{background:rgba(11,99,246,.04)}
+  .pl-meta{display:flex;justify-content:space-between;align-items:center;
+    margin-top:7px;font-size:12.2px;color:#6B7A8D;
+    font-family:ui-monospace,Consolas,monospace}
+  .pl-meta .st{color:#0B63F6;font-weight:700}
+  .pl-tools{display:flex;align-items:center;gap:12px;margin-top:11px;
+    padding-top:11px;border-top:1px dashed #E3EAF4;flex-wrap:wrap}
+  .pl-tools button{background:none;border:1px solid #DCE6F3;border-radius:9px;
+    padding:6px 11px;font-size:12.3px;color:#3B4A60;cursor:pointer;
+    display:inline-flex;align-items:center;gap:5px;font-family:inherit}
+  .pl-tools button:hover{border-color:#9FC2F5;color:#0B63F6;background:#F4F9FF}
+  .pl-tools button.on{border-color:#0E9E6E;color:#0E9E6E;background:rgba(14,158,110,.07)}
+  .pl-vol{display:flex;align-items:center;gap:7px;font-size:12.3px;color:#6B7A8D}
+  .pl-vol input{width:78px;accent-color:#0B63F6}
+  .pl-empty{font-size:12.6px;color:#8b97a8;text-align:center;padding:16px 0}
+
   .side h3{font-size:12.6px;margin:0 0 9px;color:#40506a;letter-spacing:.3px}
   .how{list-style:none;padding:0;margin:0 0 14px}
   .how li{display:flex;gap:8px;font-size:12.9px;color:#3b4a60;margin-bottom:8px}
@@ -562,6 +614,12 @@ PAGE = r"""<!doctype html>
       <div class="sub">RVC 纯 CPU · 自动校准 · 去和声 · 特征检索 · 全程离线</div>
     </div>
     <div class="badge" id="badge">正在读取模型…</div>
+    <!-- 机器能力提示：低端双核 / 缺 AVX2 时才会出现。
+         不给提示的话，用户会以为程序卡死了。 -->
+    <div id="hwNote" style="display:none;margin-top:10px;padding:11px 14px;
+      border-radius:12px;font-size:12.8px;line-height:1.6;
+      background:rgba(217,138,43,.09);border:1px solid rgba(217,138,43,.28);
+      color:#8a5a12"></div>
   </div>
 
   <!-- v2.0 双模式：翻唱用现成音频，朗读从文字开始 -->
@@ -685,11 +743,30 @@ PAGE = r"""<!doctype html>
         <div class="out" id="outbox">
           <b>转换好了</b>
           <code id="outpath"></code>
-          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px">
-            <button class="btn mini ghost" id="playIn">试听原声</button>
-            <button class="btn mini ghost" id="playOut">试听结果</button>
+
+          <div class="pl" id="sPl">
+            <div class="pl-main">
+              <button class="pl-btn" id="sPlBtn" title="播放 / 暂停">
+                <svg viewBox="0 0 24 24" id="sPlIcon"><path d="M8 5v14l11-7z"/></svg>
+              </button>
+              <canvas class="pl-wave" id="sPlWave" height="56"></canvas>
+            </div>
+            <div class="pl-meta">
+              <span id="sPlTime">0:00 / 0:00</span>
+              <span id="sPlSt" class="st"></span>
+            </div>
+            <div class="pl-tools">
+              <button id="sPlA">A 原声</button>
+              <button id="sPlB" class="on">B 结果</button>
+              <div class="pl-vol">
+                <span>音量</span>
+                <input type="range" id="sPlVol" min="0" max="100" value="100">
+              </div>
+              <button id="sPlLoop">🔁 循环</button>
+              <button id="sPlDl">⤓ 下载</button>
+            </div>
           </div>
-          <audio id="player" controls style="width:100%;display:none"></audio>
+          <audio id="player" preload="auto"></audio>
           <div class="qa" id="qaBox">
             <div class="top"><b id="qaScore">—</b><span>质量自检</span>
               <em id="qaTag">—</em></div>
@@ -776,7 +853,6 @@ PAGE = r"""<!doctype html>
           <button class="btn mini ghost" id="rdPreview">试听语调（不变声）</button>
           <span id="rdPrevMsg" style="font-size:12px;color:#7a8899;text-align:right"></span>
         </div>
-        <audio id="rdPlayer" controls style="width:100%;display:none;margin-top:8px"></audio>
       </div>
 
       <div class="card">
@@ -812,7 +888,29 @@ PAGE = r"""<!doctype html>
         <div class="out" id="rdOut">
           <b>念好了</b>
           <code id="rdOutPath"></code>
-          <audio id="rdResult" controls style="width:100%;margin:8px 0"></audio>
+
+          <!-- 自定义播放器：波形 + 播放键 + 时间 + 音量 + 循环 + 下载 -->
+          <div class="pl" id="rdPl">
+            <div class="pl-main">
+              <button class="pl-btn" id="rdPlBtn" title="播放 / 暂停">
+                <svg viewBox="0 0 24 24" id="rdPlIcon"><path d="M8 5v14l11-7z"/></svg>
+              </button>
+              <canvas class="pl-wave" id="rdPlWave" height="56"></canvas>
+            </div>
+            <div class="pl-meta">
+              <span id="rdPlTime">0:00 / 0:00</span>
+              <span id="rdPlSt" class="st"></span>
+            </div>
+            <div class="pl-tools">
+              <div class="pl-vol">
+                <span>音量</span>
+                <input type="range" id="rdPlVol" min="0" max="100" value="100">
+              </div>
+              <button id="rdPlLoop">🔁 循环</button>
+              <button id="rdPlDl">⤓ 下载</button>
+            </div>
+          </div>
+          <audio id="rdResult" preload="auto"></audio>
           <div class="qa" id="rdQa">
             <div class="top"><b id="rdQaScore">—</b><span>质量自检</span>
               <em id="rdQaTag">—</em></div>
@@ -875,6 +973,26 @@ async function loadMeta(){
   if (meta.active_model) parts.push(meta.active_model);
   parts.push(meta.index ? '检索已启用' : '无检索索引');
   $('#badge').textContent = parts.join(' · ');
+
+  // 机器能力提示
+  const hw = meta.hw || {};
+  const notes = [];
+  if (hw.avx2_note) notes.push('⚠ ' + hw.avx2_note);
+  if (hw.speed_note) notes.push('⏱ ' + hw.speed_note);
+  if (hw.cpu) notes.push('CPU：' + hw.cpu + '（' + (hw.logical || '?') + ' 线程，'
+                         + '推理用 ' + (hw.threads || '?') + ' 线程）');
+  const nb = $('#hwNote');
+  if (notes.length){
+    nb.innerHTML = notes.join('<br>');
+    nb.style.display = 'block';
+    nb.style.background = (hw.avx2_risk === 'high')
+      ? 'rgba(201,67,79,.10)' : 'rgba(217,138,43,.09)';
+    nb.style.borderColor = (hw.avx2_risk === 'high')
+      ? 'rgba(201,67,79,.3)' : 'rgba(217,138,43,.28)';
+    nb.style.color = (hw.avx2_risk === 'high') ? '#a8323e' : '#8a5a12';
+  } else {
+    nb.style.display = 'none';
+  }
 
   // 索引
   if (meta.index){
@@ -1127,23 +1245,305 @@ $('#btnClear').onclick = async () => {
   $('#qaBox').classList.remove('on');
   $('#pmsg').textContent = '选好文件后点上面按钮';
 };
-let lastPos = 0;   // A/B 对比要落在同一位置，否则切过去从头播没法比
-function play(which){
-  const a = $('#player');
+/* ================= 自绘播放器 =================
+   为什么不用浏览器原生 <audio controls>：
+   它在卡片布局里只有一条细线，用户根本看不出那是播放器，
+   以为只有"打开文件夹"这一条路 —— 也就听不到自己刚做出来的东西。
+
+   这里自己画：波形（可点跳转）、大播放键、时间、音量、循环、下载。
+   波形不是装饰：一眼看出"这里确实有声音、哪里是静音"，比单纯进度条有用。
+*/
+function fmtTime(t){
+  if (!isFinite(t) || t < 0) t = 0;
+  const m = Math.floor(t / 60), sec = Math.floor(t % 60);
+  return m + ':' + (sec < 10 ? '0' : '') + sec;
+}
+
+function makePlayer(ids){
+  const a = document.getElementById(ids.audio);
+  const cv = document.getElementById(ids.wave);
+  const btn = document.getElementById(ids.btn);
+  const icon = document.getElementById(ids.icon);
+  const timeEl = document.getElementById(ids.time);
+  const stEl = document.getElementById(ids.state);
+  const volEl = document.getElementById(ids.vol);
+  const loopBtn = document.getElementById(ids.loop);
+  const dlBtn = document.getElementById(ids.download);
+  if (!a || !cv || !btn) return null;
+
+  let peaks = null;      // 每列的峰值（0~1）
+  let src = '';          // 当前音频地址
+  let hovering = -1;
+  let raf = 0;
+
+  function paint(){
+    const dpr = window.devicePixelRatio || 1;
+    const w = cv.clientWidth || 400, h = 56;
+    if (cv.width !== Math.round(w * dpr)){
+      cv.width = Math.round(w * dpr);
+      cv.height = Math.round(h * dpr);
+    }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const dur = a.duration || 0;
+    const cur = a.currentTime || 0;
+    const prog = dur > 0 ? cur / dur : 0;
+
+    if (!peaks || !peaks.length){
+      // 还在解码：画一条待机细线
+      ctx.strokeStyle = '#D8E2F0';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2);
+      ctx.stroke();
+      return;
+    }
+
+    const n = peaks.length;
+    const bw = w / n;
+    for (let i = 0; i < n; i++){
+      const played = (i / n) < prog;
+      const hh = Math.max(2, peaks[i] * (h - 10));
+      const x = i * bw;
+      const y = (h - hh) / 2;
+      if (played){
+        ctx.fillStyle = '#0B63F6';
+      } else if (i === hovering){
+        ctx.fillStyle = '#B9D4FB';
+      } else {
+        ctx.fillStyle = '#D5E2F2';
+      }
+      ctx.fillRect(x + bw * 0.18, y, Math.max(1, bw * 0.64), hh);
+    }
+
+    // 播放头
+    const px = prog * w;
+    ctx.fillStyle = 'rgba(11,99,246,.9)';
+    ctx.fillRect(Math.min(w - 2, px), 0, 2, h);
+  }
+
+  function loopPaint(){
+    paint();
+    if (!a.paused && !a.ended){
+      raf = requestAnimationFrame(loopPaint);
+    } else {
+      raf = 0;
+    }
+  }
+
+  async function decodeWave(url){
+    peaks = null;
+    paint();
+    try{
+      const r = await fetch(url, {cache: 'no-store'});
+      if (!r.ok) return;
+      const buf = await r.arrayBuffer();
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      const ac = new AC();
+      const ab = await new Promise((ok, no) => {
+        // 老回调式签名兼容
+        const p = ac.decodeAudioData(buf, ok, no);
+        if (p && p.then) p.then(ok).catch(no);
+      });
+      const ch = ab.getChannelData(0);
+      const cols = Math.max(60, Math.min(320, Math.round((cv.clientWidth || 400) / 3)));
+      const step = Math.floor(ch.length / cols) || 1;
+      const out = new Float32Array(cols);
+      let max = 1e-9;
+      for (let i = 0; i < cols; i++){
+        let m = 0;
+        const s0 = i * step;
+        const s1 = Math.min(ch.length, s0 + step);
+        // 每列抽样 200 个点足够，避免长音频卡住
+        const skip = Math.max(1, Math.floor((s1 - s0) / 200));
+        for (let j = s0; j < s1; j += skip){
+          const v = Math.abs(ch[j]);
+          if (v > m) m = v;
+        }
+        out[i] = m;
+        if (m > max) max = m;
+      }
+      // 归一化，但保留一点相对差异，别把轻声段落放大成一样高
+      for (let i = 0; i < cols; i++) out[i] = Math.min(1, out[i] / Math.max(max * 0.92, 1e-9));
+      peaks = out;
+      try{ ac.close(); }catch(e){}
+      paint();
+    }catch(e){
+      // 解码失败不影响播放，只是没波形
+      peaks = null;
+      paint();
+    }
+  }
+
+  function setIcon(playing){
+    if (!icon) return;
+    icon.innerHTML = playing
+      ? '<path d="M7 5h4v14H7zM13 5h4v14h-4z"/>'
+      : '<path d="M8 5v14l11-7z"/>';
+    btn.classList.toggle('playing', playing);
+  }
+
+  a.addEventListener('play', () => { setIcon(true); if (!raf) loopPaint(); });
+  a.addEventListener('pause', () => { setIcon(false); paint(); });
+  a.addEventListener('ended', () => { setIcon(false); paint(); });
+  a.addEventListener('timeupdate', () => {
+    timeEl.textContent = fmtTime(a.currentTime) + ' / ' + fmtTime(a.duration);
+  });
+  a.addEventListener('loadedmetadata', () => {
+    timeEl.textContent = fmtTime(0) + ' / ' + fmtTime(a.duration);
+    paint();
+  });
+
+  btn.onclick = () => {
+    if (!src) return;
+    if (a.paused) a.play().catch(()=>{});
+    else a.pause();
+  };
+
+  // 点波形跳转。
+  // 坐标一律在**事件触发的那一刻**重新取 rect：页面滚动、布局变化之后
+  // 之前取的 rect 就失效了（实测因为这个原因跳转位置偏得离谱）。
+  cv.addEventListener('click', e => {
+    if (!a.duration) return;
+    // 优先用 offsetX：它是相对元素自身的坐标，不受页面滚动/缩放影响。
+    // 实测在 headless 环境下 clientX - rect.left 会算出偏差（0.45s vs 期望 1.32s），
+    // 而 offsetX 精确等于 306/510 = 0.6。
+    const w = cv.clientWidth || cv.getBoundingClientRect().width || 1;
+    let x = (typeof e.offsetX === 'number' && isFinite(e.offsetX))
+      ? e.offsetX
+      : (e.clientX - cv.getBoundingClientRect().left);
+    if (!isFinite(x)) x = 0;
+    const rel = Math.max(0, Math.min(1, x / w));
+    // 留个可观测标记：出问题时能直接看出"算出来的比例是多少"，
+    // 不用靠猜（这个字段也方便自动化测试）。
+    cv.dataset.rel = rel.toFixed(3);
+    try{ a.currentTime = rel * a.duration; }catch(err){}
+    paint();
+  });
+
+  // 悬停高亮（帮用户看出可以点）
+  cv.addEventListener('mousemove', e => {
+    const r = cv.getBoundingClientRect();
+    const rel = (e.clientX - r.left) / r.width;
+    hovering = peaks ? Math.floor(rel * peaks.length) : -1;
+    if (a.paused) paint();
+  });
+  cv.addEventListener('mouseleave', () => {
+    hovering = -1;
+    if (a.paused) paint();
+  });
+
+  if (volEl){
+    volEl.oninput = () => { a.volume = +volEl.value / 100; };
+    a.volume = +volEl.value / 100;
+  }
+  if (loopBtn){
+    loopBtn.onclick = () => {
+      a.loop = !a.loop;
+      loopBtn.classList.toggle('on', a.loop);
+      stEl.textContent = a.loop ? '循环播放' : '';
+    };
+  }
+  if (dlBtn){
+    dlBtn.onclick = () => {
+      if (!src) return;
+      const ext = '.wav';
+      const base = (ids.dlname || '输出').replace(/[\\/:*?"<>|]/g, '_');
+      const el = document.createElement('a');
+      el.href = src;
+      el.download = base + ext;
+      document.body.appendChild(el); el.click(); el.remove();
+    };
+  }
+
+  let loadedKey = '';     // 已装入内容的指纹（不是 URL —— URL 带时间戳每次都不同）
+
+  return {
+    /* 装入新音频。autoplay=true 时立刻播。
+       key 用来判断"是不是同一份内容"：
+       界面每 1 秒轮询一次状态，如果每次都重新装 src，
+       播放位置就会被清零 —— 表现为"播几秒自己回到开头，根本没法听"。
+       所以同一个 key 只装一次。 */
+    load(url, opt){
+      const o = opt || {};
+      // 默认指纹：去掉 URL 里的 t=时间戳参数。
+      // 这样即使某个调用点忘了传 key，同一份音频也不会被重复装载
+      // （之前就是因为漏传 key 导致播放位置被反复清零）。
+      const defKey = String(url).replace(/([?&])t=\d+&?/g, '$1')
+                                 .replace(/[?&]$/, '');
+      const key = (o.key !== undefined && o.key !== null) ? String(o.key) : defKey;
+      if (key === loadedKey && a.getAttribute('src')){
+        // 同一份内容，什么都不做。
+        // ★ 这里绝不能"如果暂停就自动 play()"：
+        //   播完（ended）之后 paused 也是 true，再 play() 会**从头重播**，
+        //   而界面每秒轮询一次 —— 表现就是"放完自己又从头开始，循环不止"。
+        return;
+      }
+      loadedKey = key;
+      window.__plReloads = (window.__plReloads || 0) + 1;   // 观测用：实际装载次数
+      src = url;
+      stEl.textContent = '';
+      a.src = url;
+      a.load();
+      decodeWave(url);
+      timeEl.textContent = '0:00 / 0:00';
+      if (o.autoplay){
+        a.play().catch(()=>{});
+      }
+    },
+    stop(){
+      try{ a.pause(); a.currentTime = 0; }catch(e){}
+      setIcon(false); paint();
+    },
+    get audio(){ return a; },
+    get src(){ return src; },
+    setLabel(t){ if (stEl) stEl.textContent = t || ''; },
+    repaint(){ paint(); }
+  };
+}
+
+/* 翻唱侧：A/B 对比共用同一个波形控件，切换时保持播放位置 */
+let lastPos = 0;
+const sPlayer = makePlayer({
+  audio: 'player', wave: 'sPlWave', btn: 'sPlBtn', icon: 'sPlIcon',
+  time: 'sPlTime', state: 'sPlSt', vol: 'sPlVol',
+  loop: 'sPlLoop', download: 'sPlDl', dlname: '转换结果'
+});
+let abWhich = 'out';
+function playAB(which){
+  if (!sPlayer) return;
+  const a = sPlayer.audio;
+  // A/B 对比要落在同一个位置，否则切过去从头播，根本比不出来
   const pos = (a.currentTime > 0.3 && !a.ended) ? a.currentTime : lastPos;
-  a.style.display = 'block';
-  a.src = '/api/audio?which=' + which + '&t=' + Date.now();
-  a.onloadedmetadata = () => { try { a.currentTime = pos; } catch(e){} };
-  a.play().catch(()=>{});
+  abWhich = which;
+  // 只通过播放器装一次 src —— 之前这里同时设了 a.src 又调 load，
+  // 等于加载两遍，会把自己打断
+  sPlayer.load('/api/audio?which=' + which + '&t=' + Date.now(), {autoplay: true});
+  a.addEventListener('loadedmetadata', () => {
+    try{ a.currentTime = Math.min(pos, (a.duration || pos)); }catch(e){}
+  }, {once: true});
+  sPlayer.setLabel(which === 'in' ? '正在试听原声' : '正在试听结果');
+  $('#sPlA').classList.toggle('on', which === 'in');
+  $('#sPlB').classList.toggle('on', which === 'out');
 }
 $('#player').addEventListener('timeupdate', e => {
   if (!e.target.paused) lastPos = e.target.currentTime;
 });
-$('#playIn').onclick = () => play('in');
-$('#playOut').onclick = () => play('out');
+$('#sPlA').onclick = () => playAB('in');
+$('#sPlB').onclick = () => playAB('out');
 
 /* ================= v2.0 朗读模式 ================= */
 let rdMode = 'sing', rdOpts = null, rdBusy = false;
+
+// 朗读结果的播放器（和翻唱那个同一套组件，各自的 audio 元素）
+const rdPlayer = makePlayer({
+  audio: 'rdResult', wave: 'rdPlWave', btn: 'rdPlBtn', icon: 'rdPlIcon',
+  time: 'rdPlTime', state: 'rdPlSt', vol: 'rdPlVol',
+  loop: 'rdPlLoop', download: 'rdPlDl', dlname: '朗读'
+});
 
 function setMode(m){
   rdMode = m;
@@ -1222,10 +1622,9 @@ $('#rdPreview').onclick = async () => {
       body: JSON.stringify({text: text, emotion: emo,
                             voice: $('#rdVoice').value || null})})).json();
     if (j.ok){
-      const a = $('#rdPlayer');
-      a.style.display = 'block';
-      a.src = '/api/audio?which=preview&t=' + Date.now();
-      a.play().catch(()=>{});
+      // 走同一个播放器，别再退回原生 audio（那个在这个布局里看不见）
+      if (rdPlayer) rdPlayer.load('/api/audio?which=preview&t=' + Date.now(), {autoplay: true});
+      if (rdPlayer) rdPlayer.setLabel('试听载体（未变声）');
       $('#rdPrevMsg').textContent = j.voice + ' / ' + j.emotion;
     } else {
       $('#rdPrevMsg').textContent = j.error || '失败';
@@ -1321,8 +1720,12 @@ function rdRender(s){
     $('#rdMsg').textContent = s.msg || '完成';
     $('#rdOut').classList.add('on');
     $('#rdOutPath').textContent = s.output || '';
-    const a = $('#rdResult');
-    a.src = '/api/audio?which=out&t=' + Date.now();
+    // 装进播放器并自动播一次。key 用输出路径：轮询时同一份结果不会重装，
+    // 否则每次轮询都把播放位置清零（实测就是这个原因导致"听不了"）
+    if (rdPlayer){
+      rdPlayer.load('/api/audio?which=out&t=' + Date.now(),
+                    {autoplay: true, key: s.output || 'read_out'});
+    }
     const q = s.qa;
     if (q){
       $('#rdQa').classList.add('on');
@@ -1490,6 +1893,66 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a):
         pass
 
+    def _serve_file(self, path, ctype, download_name=None):
+        """带 Range 支持的文件响应。
+
+        播放器拖动进度、A/B 对比保持位置都依赖这个：没有 Range，
+        浏览器就只能从头顺序播，seek 全部失效。
+        """
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return self._json({"ok": False, "error": "文件读不到"}, 404)
+        rng = self.headers.get("Range") or ""
+        start, end = 0, size - 1
+        partial = False
+        if rng.startswith("bytes="):
+            spec = rng[6:].split(",")[0].strip()
+            try:
+                a, _, b = spec.partition("-")
+                if a == "":                      # bytes=-500 取末尾
+                    start = max(0, size - int(b))
+                else:
+                    start = int(a)
+                    if b:
+                        end = int(b)
+                end = min(end, size - 1)
+                if start > end or start >= size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % size)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                partial = True
+            except Exception:
+                start, end, partial = 0, size - 1, False
+
+        length = end - start + 1
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        if download_name:
+            from urllib.parse import quote as _q
+            self.send_header("Content-Disposition",
+                             "attachment; filename*=UTF-8''%s" % _q(download_name))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = length
+                while left > 0:
+                    buf = f.read(min(262144, left))
+                    if not buf:
+                        break
+                    self.wfile.write(buf)
+                    left -= len(buf)
+        except (BrokenPipeError, ConnectionResetError):
+            pass       # 播放器跳到别处时会主动断连，正常现象
+
     def _json(self, obj, code=200):
         data = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
@@ -1529,13 +1992,12 @@ class Handler(BaseHTTPRequestHandler):
                 p = outs[idx] if 0 <= idx < len(outs) else (outs[-1] if outs else "")
             if not p or not os.path.isfile(p):
                 return self._json({"ok": False, "error": "还没有可试听的文件"}, 404)
-            data = open(p, "rb").read()
-            self.send_response(200)
-            self.send_header("Content-Type", "audio/wav")
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(data)
+
+            # ★ 必须支持 HTTP Range，否则浏览器**无法拖动进度条**：
+            #   媒体元素靠 byte range 请求做 seek，服务器不认 Range 时
+            #   audio.seekable 为空，给 currentTime 赋值会被静默忽略
+            #   （实测：波形点击算出的比例是对的 0.600，但播放位置纹丝不动）。
+            self._serve_file(p, "audio/wav")
         elif u.path == "/api/meta":
             try:
                 self._json(meta())
