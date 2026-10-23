@@ -1,5 +1,27 @@
+# 推理必需
 numpy
 onnxruntime==1.22.1
 soundfile
 soxr
+
+# 特征检索（.index 加速音色贴合）。不装也能跑，只是 index_rate 无效
 faiss-cpu
+
+# 朗读模式（文字 → 声音）的载体合成
+edge-tts
+
+# ---- 以下不装也能用，只有特定功能需要 ----
+
+# .pth → ONNX 转换（tools/export_generator.py）
+# PyTorch 体积很大，只在需要导入 .pth 模型时安装：
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# torch
+
+# 去和声 / 分人声（rvc_cpu/separate.py 会调带 torch 的子进程）
+#   pip install "audio-separator[cpu]"
+# audio-separator
+
+# INT8 量化（tools/quantize_gen.py，实测无收益，仅留作换机器再评估）
+#   pip install onnx sympy
+# onnx
+# sympy

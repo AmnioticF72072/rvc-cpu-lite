@@ -18,3 +18,9 @@ env/
 
 _glm_key.json
 !models/registry.json
+_工作区/
+_测试残留/
+models/sep/
+models/quant/
+*.rar
+*.zip
