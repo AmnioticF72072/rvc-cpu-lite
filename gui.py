@@ -79,12 +79,25 @@ def meta():
         return _meta_cache
     from rvc_cpu import models as mm
     gen, vec, rmv, idx = model_paths()
-    from rvc_cpu import separate as sep
-    from rvc_cpu.hw_profile import pick_profile as _pp
-    _hw = _pp()
-    probe = sep.probe()
+    # 附加信息（分离引擎 / 硬件探测）失败绝不能拖垮整个 meta ——
+    # 它们只是给界面做提示用的，缺了顶多少显示一行，
+    # 但 meta 挂掉会让模型列表整个消失，那才是致命的。
+    try:
+        from rvc_cpu import separate as sep
+        probe = sep.probe()
+    except Exception as _e:
+        probe = {"ready_karaoke": False, "ready_vocals": False,
+                 "karaoke_models": [], "python": "", "backends": [],
+                 "bundled": False, "error": str(_e)[:80]}
+    try:
+        from rvc_cpu.hw_profile import pick_profile as _pp
+        _hw = _pp()
+    except Exception:
+        _hw = {}
     index_info = None
-    if idx:
+    # 双重保险：即使上游给了不存在的路径，也不能让整个 meta 挂掉。
+    # meta 挂了 = 界面拿不到模型列表 = 用户看到"什么都选不了"。
+    if idx and os.path.isfile(idx):
         index_info = {"name": os.path.basename(idx),
                       "mb": round(os.path.getsize(idx) / 1024 ** 2, 1)}
         try:
@@ -953,7 +966,7 @@ PAGE = r"""<!doctype html>
 
 <script>
 const $ = s => document.querySelector(s);
-let picked = null, timer = null, meta = null, autoKey = null, lastImported = '';
+let picked = null, timer = null, meta = null, autoKey = null, lastImported = '', _wasImporting = false;
 
 function setPicked(name){
   picked = name;
@@ -1771,16 +1784,32 @@ async function poll(){
   clearTimeout(timer);
   const s = await (await fetch('/api/state')).json();
   try{ rdRender(s); }catch(e){}
-  if (s.imported && s.imported !== lastImported){
+  // 导入刚结束（importing → 非 importing）→ 一定要刷新列表。
+  // 只靠 imported 变化来判断不够：同一个模型重复导入（内容相同会直接复用）
+  // 时 imported 的值没变，列表就不会刷，用户会以为"导入没成功"。
+  const wasImp = _wasImporting;
+  _wasImporting = (s.stage === 'importing');
+  if (s.imported && (s.imported !== lastImported || (wasImp && !_wasImporting))){
     lastImported = s.imported;
     meta = await (await fetch('/api/meta')).json();
     renderModels(meta);
     $('#pmsg').textContent = '已导入并切换到「' + s.imported + '」';
+  } else if (wasImp && !_wasImporting && s.stage === 'error'){
+    // 导入失败：把列表也刷一遍，避免界面停在旧状态
+    meta = await (await fetch('/api/meta')).json();
+    renderModels(meta);
   }
   const p = Math.round((s.frac||0)*100);
   $('#bar').style.width = p+'%';
   $('#pct').textContent = p+'%';
   let msg = (s.phase ? '['+s.phase+'] ' : '') + (s.msg||'');
+  // 出错时必须把**真实原因**显示出来。
+  // 原来只显示 s.msg（往往是"导入失败"这种笼统文案），
+  // 真正的原因在 s.error 里 —— 用户看到的就是"点了没反应/导入失败"，
+  // 完全无从下手，只能来问。
+  if (s.stage === 'error' && s.error){
+    msg = s.error;
+  }
   // 预计剩余：按"已用时间 / 已完成进度"反推，进度太小时不显示（会乱跳）
   if(s.started_at && s.frac > 0.06 && s.frac < 0.995 &&
      ['running','separating'].includes(s.stage)){

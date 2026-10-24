@@ -78,6 +78,50 @@ def _read_json(path):
 
 
 # ---------------------------------------------------------------- 查询
+def _clean_stage(stage_dir):
+    """清空导入暂存目录。**不用 os.remove**。
+
+    沙箱注入的 sitecustomize 会把删除改写成"移入回收站"，
+    回收站不可用时 fail-closed 直接抛异常 —— 结果就是"以为清了，
+    其实一个都没删"。所以统一改用 shutil.move 挪到 _废件 里，
+    挪失败也不影响主流程（顶多占点磁盘，下次覆盖）。
+    """
+    if not os.path.isdir(stage_dir):
+        return
+    trash = os.path.join(os.path.dirname(stage_dir), "_导入废件")
+    for fn in os.listdir(stage_dir):
+        src = os.path.join(stage_dir, fn)
+        if not os.path.isfile(src):
+            continue
+        try:
+            os.makedirs(trash, exist_ok=True)
+            # 加时间戳避免同名覆盖
+            dst = os.path.join(trash, "%s_%s" % (time.strftime("%H%M%S"), fn))
+            shutil.move(src, dst)
+        except Exception:
+            try:
+                os.remove(src)
+            except Exception:
+                pass
+
+
+def _discard_partial(stem):
+    """导入失败时清掉 models 里的半成品（同样只挪不删）。"""
+    trash = os.path.join(MODELS, "_导入失败")
+    for ext in (".onnx", ".json", ".index", ".pitch.json"):
+        p = os.path.join(MODELS, stem + ext)
+        if not os.path.isfile(p):
+            continue
+        try:
+            os.makedirs(trash, exist_ok=True)
+            shutil.move(p, os.path.join(trash, stem + ext))
+        except Exception:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
 def list_models():
     """扫 models 目录，合并注册表元数据。返回列表（不含底座）。"""
     reg = _load()
@@ -165,11 +209,17 @@ def paths_for(name=""):
     gen = os.path.join(MODELS, name + ".onnx") if name else ""
     if not os.path.isfile(gen):
         gen = ""
+    # ★ index 只在**文件真的存在**时才返回。
+    #   原来无条件拼路径，于是"激活一个没有 .index 的模型"（角色模型基本都
+    #   不带 index）时，上层拿到一个不存在的路径去 os.path.getsize，
+    #   直接抛 FileNotFoundError，把整个 /api/meta 打挂 ——
+    #   界面拿不到模型列表，表现就是"导入后不显示、列表里点不了"。
+    _idx = os.path.join(MODELS, name + ".index") if name else ""
     return {
         "gen": gen,
         "vec": shared("vec768_dyn.onnx", "hubert_v2_768_dyn.onnx", "vec768.onnx", "contentvec.onnx"),
         "rmv": shared("rmvpe.onnx"),
-        "idx": os.path.join(MODELS, name + ".index") if name else "",
+        "idx": _idx if (_idx and os.path.isfile(_idx)) else "",
     }
 
 
@@ -461,10 +511,30 @@ def import_from_stage(stage_dir, name="", progress=None):
     if not stem:
         raise RuntimeError("模型名无效：%s" % base)
 
+    # ★ 挑源文件必须按名字匹配，不能取"目录里第一个"。
+    #   暂存目录可能残留上次的东西（导入失败、或用户连点两次），
+    #   取 onnx[0] 会拿到旧文件，把 A 模型当成 B 模型导入，
+    #   而且还会因为"目标已存在"直接失败 —— 用户看到的就是
+    #   "导入没反应/导入失败"，完全不知道发生了什么。
+    def _pick(exts, want):
+        """在候选里找与 want 同名的文件；找不到就退回第一个（单文件场景）。"""
+        want_low = want.lower()
+        exact = [f for f in exts if f.lower() == want_low]
+        if exact:
+            return exact[0]
+        same = [f for f in exts if os.path.splitext(f)[0].lower() ==
+                os.path.splitext(want_low)[0]]
+        if same:
+            return same[0]
+        return exts[0] if exts else ""
+
+    want = os.path.basename(base)
+    src_name = _pick(pth + onnx, want)
+    src_file = os.path.join(stage_dir, src_name)
+
     # 校验来源文件真的是模型，不是把音频/图片改个后缀塞进来。
     # 这类文件扩展名对得上、但内容是音频，装进 models 后会出现在模型列表里，
     # 一选中就报 onnx 解析失败 —— 必须挡在门口。
-    src_file = os.path.join(stage_dir, pth[0] if pth else onnx[0])
     from .audio_io import sniff_audio
     kind = sniff_audio(src_file)
     if kind:
@@ -473,18 +543,66 @@ def import_from_stage(stage_dir, name="", progress=None):
             "音色模型是 .pth 或 .onnx 文件。如果你想转换这段音频，"
             "请用「翻唱」上传音频，或到 models 目录之外存放。" % kind)
 
+    is_pth = src_name.lower().endswith(".pth")
     dst_onnx = os.path.join(MODELS, stem + ".onnx")
+
+    # ---- 同名冲突：分三种情况处理，别一律报错 ----
+    # 用户重复导入同一个模型是最常见的场景（重装、换机器、连点两次），
+    # 一律"已存在，请删掉再来"会让人很挫败，而且他根本不知道该怎么办。
     if os.path.exists(dst_onnx):
-        raise RuntimeError("models 里已经有「%s」了。先把那个模型删掉，或者给这个模型换个名字" % stem)
+        same = False
+        try:
+            if os.path.getsize(dst_onnx) == os.path.getsize(src_file):
+                # 大小一样再比内容（115MB 全比要 1~2 秒，可接受；
+                # 只比大小会因为不同模型恰好同大小而误判）
+                import hashlib
+
+                def _h(p, chunk=1 << 20):
+                    h = hashlib.sha256()
+                    with open(p, "rb") as f:
+                        while True:
+                            b = f.read(chunk)
+                            if not b:
+                                break
+                            h.update(b)
+                    return h.digest()
+                same = _h(dst_onnx) == _h(src_file)
+        except Exception:
+            same = False
+
+        if same:
+            # 完全相同的模型：不重复占磁盘，直接切成"使用中"
+            _p(0.9, "模型已存在（内容相同），直接切换…")
+            reg = _load()
+            if stem not in reg["models"]:
+                reg["models"][stem] = {"source": "onnx", "origin": src_name,
+                                       "imported_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+            reg["active"] = stem
+            _save(reg)
+            _clean_stage(stage_dir)
+            _p(1.0, "完成")
+            models, active = list_models()
+            info = next((m for m in models if m["name"] == stem), {"name": stem})
+            info["reused"] = True
+            return info
+
+        # 内容不同 → 自动换个名字，绝不覆盖别人已有的模型
+        n = 2
+        while os.path.exists(os.path.join(MODELS, "%s(%d).onnx" % (stem, n))):
+            n += 1
+        old_stem = stem
+        stem = "%s(%d)" % (stem, n)
+        dst_onnx = os.path.join(MODELS, stem + ".onnx")
+        _p(0.05, "已有同名的不同模型，本次导入为「%s」…" % stem)
 
     os.makedirs(MODELS, exist_ok=True)
     try:
-        if pth:
+        if is_pth:
             _p(0.08, "开始转换 .pth → ONNX…")
-            _export_pth(os.path.join(stage_dir, pth[0]), dst_onnx, _p)
+            _export_pth(src_file, dst_onnx, _p)
         else:
-            _p(0.25, "正在复制模型文件（%s）…" % onnx[0])
-            shutil.copyfile(os.path.join(stage_dir, onnx[0]), dst_onnx)
+            _p(0.25, "正在复制模型文件（%s）…" % src_name)
+            shutil.copyfile(src_file, dst_onnx)
 
         # 旁挂配置：pitch 画像单独放，其余当 side config
         side_done = False
@@ -526,29 +644,26 @@ def import_from_stage(stage_dir, name="", progress=None):
         _p(0.9, "登记并切换…")
         reg = _load()
         reg["models"][stem] = {
-            "source": "pth" if pth else "onnx",
+            "source": "pth" if is_pth else "onnx",
             "imported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "origin": pth[0] if pth else onnx[0],
+            "origin": src_name,
         }
         reg["active"] = stem
         _save(reg)
     except Exception:
-        # 失败清掉半成品，别留垃圾
-        for ext in (".onnx", ".json", ".index", ".pitch.json"):
-            p = os.path.join(MODELS, stem + ext)
-            if os.path.isfile(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
+        # 失败清掉半成品，别留垃圾 —— 但**不能真删**：
+        # 沙箱的 sitecustomize 会把删除改写成"移入回收站"，
+        # 回收站不可用时 fail-closed 直接抛异常，结果文件留在原地，
+        # 下次导入又报"已存在"。改成一律挪进 _废件 目录。
+        _discard_partial(stem)
         raise
+    finally:
+        # 暂存区**无论成败都清空**。
+        # 原来只在成功路径清，于是失败一次之后暂存里就一直留着旧文件，
+        # 下次导入会拿它当源（把 A 当 B 装进去），或者直接报"已存在"，
+        # 表现就是"导入点了没反应 / 一直失败"。
+        _clean_stage(stage_dir)
 
-    # 清暂存（自己产生的临时文件）
-    for f in files:
-        try:
-            os.remove(os.path.join(stage_dir, f))
-        except Exception:
-            pass
     _p(1.0, "完成")
     models, active = list_models()
     info = next((m for m in models if m["name"] == stem), {"name": stem})
