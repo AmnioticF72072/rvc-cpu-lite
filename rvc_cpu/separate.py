@@ -39,9 +39,12 @@ def probe():
         info["backends"].append("demucs")
         info["ready_vocals"] = True
     m = _karaoke.find_model()
+    has_sep = _karaoke.has_separator_backend()
+    info["has_separator"] = has_sep
+    info["karaoke_hint"] = "" if has_sep else _karaoke.missing_hint()
     if m:
         info["karaoke_models"].append(m)
-        info["ready_karaoke"] = bool(py and _karaoke.has_separator_backend())
+        info["ready_karaoke"] = bool(py and has_sep and m)
     return info
 
 
@@ -88,11 +91,10 @@ def run(mode, in_path, out_dir, on_progress=None, model=""):
     os.makedirs(out_dir, exist_ok=True)
     if mode == "karaoke" and not model:
         model = _karaoke.find_model()
-        if model and not _karaoke.has_separator_backend():
-            raise RuntimeError(
-                "找到去和声模型「%s」，但缺少 audio-separator 组件。\n"
-                "改用「分人声」模式可以去掉伴奏（内置引擎，不需要额外组件）。"
-                % os.path.basename(model))
+        if not _karaoke.has_separator_backend():
+            raise RuntimeError(_karaoke.missing_hint())
+        if not model:
+            raise RuntimeError(_karaoke.missing_hint())
 
     cmd = [py, WORKER, "--in", in_path, "--out", out_dir, "--mode", mode]
     if model:

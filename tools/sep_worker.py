@@ -24,8 +24,20 @@ def emit(**kw):
 
 
 def find_karaoke_model():
-    """在 common 的模型缓存里找 Karaoke 模型。"""
+    """找 Karaoke 模型。
+
+    ★ 包内的 models\\sep 必须排在第一位。
+      原来只找 ~/.cache/audio_separator 这类用户缓存 ——
+      而升级包是把模型装在 models\\sep 里的，于是"模型明明在那儿，
+      程序却说找不到"，去和声永远开不起来。
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     pats = []
+    # 1) 包内（升级包装在这里）
+    for base in (os.path.join(root, "models", "sep"),
+                 os.path.join(root, "models")):
+        pats += [os.path.join(base, "*.pth"), os.path.join(base, "*.onnx")]
+    # 2) 用户缓存（以前下载过的）
     home = os.path.expanduser("~")
     for base in (os.path.join(home, ".cache", "audio_separator"),
                  os.path.join(home, ".cache", "audio_separator", "models"),
@@ -116,9 +128,50 @@ def run_demucs(in_path, out_dir):
     emit(stage="separating", frac=0.12,
          msg="加载分离模型（%d 线程，重叠 %.2f）…" % (threads, overlap))
 
+    # ★ 进度必须分段上报。
+    #   原来只在 0.2 和 0.95 报两次，而 demucs 在 CPU 上很慢
+    #   （实测 30 秒音频要 194 秒，RTF 6.5 —— 4 分钟的歌要 20 分钟以上），
+    #   于是进度条二十多分钟钉在 20% 不动，用户以为程序卡死了。
+    #   demucs 的 callback 会在每个 segment 处理完时回调，
+    #   带 segment_offset / audio_length，据此能算出真实进度。
+    _t0 = time.time()
+    _last = [-1.0]
+
+    def _cb(d):
+        try:
+            total = float(d.get("audio_length") or 0)
+            off = float(d.get("segment_offset") or 0)
+            st = d.get("state")
+            if total > 0:
+                frac = max(0.0, min(1.0, off / total))
+                if st == "end":
+                    # segment 处理完，进度按"起点 + 一个 segment"估算（略保守）
+                    frac = max(0.0, min(1.0, (off + total * 0.05) / total))
+            else:
+                frac = 0.0
+            # 变化不到 1% 就不发，避免把 stdout 管道刷爆
+            if frac - _last[0] < 0.01 and st != "end":
+                return
+            _last[0] = frac
+
+            elapsed = time.time() - _t0
+            eta = ""
+            if frac > 0.03:
+                left = max(0.0, elapsed / frac - elapsed)
+                if left >= 60:
+                    eta = " · 预计还要 %d 分" % round(left / 60)
+                elif left >= 10:
+                    eta = " · 预计还要 %d 秒" % round(left)
+            emit(stage="separating",
+                 frac=0.18 + 0.74 * frac,
+                 msg="正在分离 %d%%%s" % (int(frac * 100), eta))
+        except Exception:
+            pass
+
     sep = Separator(model="htdemucs", device="cpu", progress=False,
-                    overlap=overlap, shifts=1, split=True)
-    emit(stage="separating", frac=0.2, msg="正在分离人声与伴奏…（这一步最慢）")
+                    overlap=overlap, shifts=1, split=True,
+                    callback=_cb)
+    emit(stage="separating", frac=0.18, msg="正在分离 0%…")
 
     # ★ 自己读音频，不用 sep.separate_audio_file()。
     #   后者内部走 sphn（Rust 实现），实测在**中文路径 / 相对路径**上会报

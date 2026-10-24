@@ -43,9 +43,39 @@ def find_model():
 
 
 def has_separator_backend():
-    """audio-separator 是否可用（跑 Karaoke 的前提）。"""
-    try:
-        import audio_separator  # noqa: F401
-        return True
-    except Exception:
+    """audio-separator 是否可用（跑 Karaoke 的前提）。
+
+    ★ 不能靠 `import audio_separator` 判断。
+      主进程的 sys.path 里**没有** runtime\_sep_libs（那是给分离子进程用的），
+      所以在主进程里 import 一定失败 —— 即使依赖装得好好的，
+      也会被判成"不可用"，界面永远不会给用户开这个功能。
+
+      改成看**文件在不在**：升级包就是把 audio_separator 及其依赖
+      解到 runtime\_sep_libs 下。目录在 + 关键 pyd 在 = 装好了。
+      真跑的时候如果文件被人为删残，sep_worker 会报明确错误，
+      那时错误信息足够定位，不需要在探测阶段花 import 的代价。
+    """
+    libs = os.path.join(ROOT, "runtime", "_sep_libs")
+    pkg = os.path.join(libs, "audio_separator")
+    if not os.path.isdir(pkg):
         return False
+    # 确认不是空壳目录（解压中断会留下空目录）
+    try:
+        if not os.listdir(pkg):
+            return False
+    except OSError:
+        return False
+    return True
+
+
+def missing_hint():
+    """为什么去和声不可用 —— 给界面显示用。"""
+    libs = os.path.join(ROOT, "runtime", "_sep_libs")
+    if not has_separator_backend():
+        return ("未安装「去和声」组件。\n"
+                "这是可选的扩展包，需要单独下载「去和声升级包」并双击里面的安装程序。\n"
+                "只想去掉伴奏的话，用「分人声」就行 —— 那个是内置的，不用装东西。")
+    if not find_model():
+        return ("组件已装好，但缺少去和声模型（5_HP-Karaoke-UVR.pth）。\n"
+                "请把模型放到 models\\sep\\ 目录里。")
+    return ""

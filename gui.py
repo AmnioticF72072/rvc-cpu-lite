@@ -132,6 +132,8 @@ def meta():
             # 是不是内置引擎：界面要明确告诉用户"不用另外装东西"
             "bundled": probe.get("bundled", False),
             "engine": "内置分离引擎" if probe.get("bundled") else "",
+            # 去和声组件装没装 —— 界面据此区分"缺组件"和"缺模型"
+            "has_separator": bool(probe.get("has_separator")),
         },
         # 机器能力：低端机要提前告知，不能让用户干等半小时还以为卡死了
         "hw": {
@@ -1024,7 +1026,17 @@ async function loadMeta(){
   } else if (!s.ready_karaoke){
     const k = document.querySelector('input[name=sep][value=karaoke]');
     if (k) k.disabled = true;
-    warn.textContent = '没找到 Karaoke 模型（' + (s.karaoke_models||[]).join(', ') + '）。「分人声」可用；要用「去和声」，把 5_HP-Karaoke-UVR.pth 放进 models\\sep。';
+    // 分两种情况：缺组件（要装升级包）vs 组件在但缺模型（放文件就行）。
+    // 原来只报了"没找到模型"，但绝大多数人是根本没装组件 ——
+    // 让他们去 models\sep 放文件是白费功夫。
+    if (!s.has_separator){
+      warn.textContent = '「去和声」需要单独安装扩展包（约 410 MB），'
+        + '这个整合包里没带。「分人声」是内置的，可以直接用 —— '
+        + '它会把伴奏整个剥掉，效果通常够用。';
+    } else {
+      warn.textContent = '「去和声」组件已装好，但缺模型文件。'
+        + '把 5_HP-Karaoke-UVR.pth 放进 models\\sep 就能用。';
+    }
     warn.classList.add('on');
   }
 }

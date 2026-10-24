@@ -18,8 +18,8 @@ import zipfile
 
 SRC_STAGE = r"G:\AIVoice\dist\Plus2.1\声音转换Plus"
 CODE = r"G:\AIVoice\rvc-cpu-portable"
-OUT_DIR = r"G:\AIVoice\dist\Plus2.2.1"
-OUT_ZIP = os.path.join(OUT_DIR, "声音转换Plus_v2.2.1.zip")
+OUT_DIR = r"G:\AIVoice\dist\Plus2.2.2"
+OUT_ZIP = os.path.join(OUT_DIR, "声音转换Plus_v2.2.2.zip")
 TOP = "声音转换Plus"
 
 # 需要同步的代码（相对 CODE）
@@ -34,7 +34,7 @@ FILES = [
     "rvc_cpu/sep/__init__.py", "rvc_cpu/sep/worker.py", "rvc_cpu/sep/karaoke.py",
     "tools/sep_worker.py",
 ]
-DOCS = ["docs/2.2-说明.md", "docs/2.2.1-修复说明.md", "docs/角色音色朗读.md", "docs/v2.0-说明.md"]
+DOCS = ["docs/2.2-说明.md", "docs/2.2.1-修复说明.md", "docs/2.2.2-修复说明.md", "docs/角色音色朗读.md", "docs/v2.0-说明.md"]
 
 # 打包时跳过（垃圾/缓存/用户数据）
 SKIP_DIRS = {"_工作区", "_测试残留", "__pycache__", ".git", "_old"}
