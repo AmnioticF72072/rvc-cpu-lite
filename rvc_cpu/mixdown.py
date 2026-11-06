@@ -34,8 +34,23 @@ def _read_mono_or_stereo(path):
 
 
 def _resample(x, sr_in, sr_out):
+    """采样率转换。优先 soxr（带抗混叠低通），没有才退回线性插值。
+
+    为什么不能只用线性插值：降采样时不先低通会把 22kHz 以上的能量折叠回来
+    （44.1k/48k 混用很常见，比如人声轨是 48k、伴奏轨是 44.1k），
+    折叠产生的宽带噪声就在可听频段里，听感是"沙"、是"电"。
+    soxr 已经是本项目的依赖（推理链在用），这里直接用它的 VHQ 档。
+    """
     if sr_in == sr_out:
         return x
+    if x.size == 0:
+        return x
+    try:
+        import soxr
+        y = soxr.resample(x, sr_in, sr_out, quality="VHQ")
+        return np.asarray(y, dtype=np.float32).reshape(-1, x.shape[1])
+    except Exception:
+        pass
     n = int(round(len(x) * sr_out / sr_in))
     if n <= 0:
         return np.zeros((0, x.shape[1]), np.float32)
@@ -85,6 +100,10 @@ def mix(vocal_path, accomp_path, out_path, vocal_db=DEFAULT_VOCAL_DB,
             v = np.repeat(v, a.shape[1], axis=1)
         elif a.shape[1] == 1:
             a = np.repeat(a, v.shape[1], axis=1)
+        else:
+            raise RuntimeError(
+                "人声是 %d 声道、伴奏是 %d 声道，对不上。请把其中一条换成单声道或立体声再混。"
+                % (v.shape[1], a.shape[1]))
 
     # 长度对齐：分离是分块做的，末尾可能差几十毫秒
     n = min(len(v), len(a))

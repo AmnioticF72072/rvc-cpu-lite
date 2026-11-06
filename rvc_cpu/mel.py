@@ -1,11 +1,29 @@
 # -*- coding: utf-8 -*-
-"""Mel 频谱（纯 numpy，数值对齐 librosa slaney 规范）
+"""Mel 频谱（纯 numpy，数值对齐 librosa）+ STFT。
 
-- slaney 频率尺度 + slaney 面积归一化（与 librosa.filters.mel 等价）
+- 频率刻度：**HTK**（m = 2595*log10(1+f/700)）—— RMVPE 的权重就是这样训练的
+- 面积归一化：slaney 规范（librosa 在 htk=True 时同样会做这一步）
 - STFT 纯 numpy（center=True 反射填充、hann 窗，与 librosa.stft 一致）
 - 零依赖（numpy 之外），便携包体积最小
+
+关于刻度：这版的前身误用了 slaney 刻度（librosa 的默认值），而 RMVPE
+训练时用的是 htk=True。刻度错位会让同一个频率落到不同通道号上，实测所有
+基频系统性偏低 467~612 音分（约 5 个半音）—— 音高条件一错，模型唱什么都
+不对，听起来发"电"、跑调、不像本人。四种独立估计器（harvest / Praat /
+pyin / torch 版 RMVPE）交叉验证过：196 Hz 的合成音，HTK 读 196.3 Hz，
+slaney 读 140.6 Hz。所以这里默认 htk=True，旧行为保留在 htk=False 里仅供对照。
 """
 import numpy as np
+
+
+def hz_to_mel_htk(freq):
+    """HTK 刻度：m = 2595 * log10(1 + f/700)"""
+    return 2595.0 * np.log10(1.0 + np.asarray(freq, dtype=np.float64) / 700.0)
+
+
+def mel_to_hz_htk(mels):
+    """HTK 刻度反变换：f = 700 * (10^(m/2595) - 1)"""
+    return 700.0 * (10.0 ** (np.asarray(mels, dtype=np.float64) / 2595.0) - 1.0)
 
 
 def _stft_magnitude(audio, n_fft, hop, win):
@@ -50,20 +68,28 @@ def mel_to_hz_slaney(mels):
     return freqs
 
 
-def mel_filterbank(sr, n_fft, n_mels, fmin=0.0, fmax=None, dtype=np.float32):
-    """等价 librosa.filters.mel(..., htk=False)（slaney 规范）。"""
+def mel_filterbank(sr, n_fft, n_mels, fmin=0.0, fmax=None, dtype=np.float32, htk=True):
+    """等价 librosa.filters.mel(..., htk=True)。
+
+    htk=True  —— HTK 刻度（RMVPE 训练时用的就是这个，必须保持默认）
+    htk=False —— slaney 刻度（误用过，保留只为对照/回归测试）
+    """
     fmax = fmax if fmax is not None else sr / 2.0
     weights = np.zeros((n_mels, int(1 + n_fft // 2)), dtype=dtype)
     fftfreqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
-    mel_f = mel_to_hz_slaney(np.linspace(hz_to_mel_slaney(fmin),
-                                         hz_to_mel_slaney(fmax), n_mels + 2))
+    if htk:
+        mel_f = mel_to_hz_htk(np.linspace(hz_to_mel_htk(fmin),
+                                          hz_to_mel_htk(fmax), n_mels + 2))
+    else:
+        mel_f = mel_to_hz_slaney(np.linspace(hz_to_mel_slaney(fmin),
+                                             hz_to_mel_slaney(fmax), n_mels + 2))
     fdiff = np.diff(mel_f)
     ramps = np.subtract.outer(mel_f, fftfreqs)
     for i in range(n_mels):
         lower = -ramps[i] / fdiff[i]
         upper = ramps[i + 2] / fdiff[i + 1]
         weights[i] = np.maximum(0, np.minimum(lower, upper))
-    # slaney 面积归一化
+    # 面积归一化（slaney 规范，librosa 在两种刻度下都会做）
     enorm = 2.0 / (mel_f[2:n_mels + 2] - mel_f[:n_mels])
     weights *= enorm[:, np.newaxis]
     return weights

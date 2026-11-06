@@ -77,14 +77,26 @@ def available_accel():
 
 
 def _ep_session(model_path, intra_threads, eps):
-    """带加速后端的 session。CPU 永远排在最后兜底。"""
+    """带加速后端的 session。CPU 永远排在最后兜底。
+
+    ★ 返回前必须核对 session **实际**注册了哪些 provider。
+      onnxruntime 在 EP 加载失败时（比如装了 onnxruntime-gpu 但没有 CUDA DLL、
+      或显卡驱动版本不匹配）**不抛异常**，只打一条日志就用 CPU 跑完。原实现
+      直接 return，于是界面上一直显示 "CUDA(GPU)"，实际跑的是 CPU ——
+      用户只看到"勾了 GPU 还是这么慢"，根本无从查起。
+    """
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
     opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     opts.intra_op_num_threads = intra_threads
     opts.inter_op_num_threads = 1
     providers = list(eps) + ["CPUExecutionProvider"]
-    return ort.InferenceSession(model_path, sess_options=opts, providers=providers)
+    sess = ort.InferenceSession(model_path, sess_options=opts, providers=providers)
+    actual = list(sess.get_providers())
+    if not any(ep in actual for ep in eps):
+        raise RuntimeError("加速后端 %s 没能真正加载（onnxruntime 已静默退回 CPU）"
+                           % "/".join(eps))
+    return sess
 
 
 def _ov_compile(model_path, device, num_threads=4):
@@ -245,6 +257,12 @@ class RvcPipeline:
             print("[加载] RMVPE → ORT CPU（f0 永不跑核显）")
         self.rmvpe = RMVPE(rmvpe_path, providers=["CPUExecutionProvider"])
         self.rmvpe_path = rmvpe_path      # 朗读流程复用它量载体/输出音高
+
+        # 设备标签纠偏：上面那行 [设备] 是"打算用"，这里报"实际在用"。
+        # 两者不一致时必须说清楚，否则用户会以为 GPU 没起作用是别的原因。
+        if verbose and self._eps == [] and used:
+            print("[设备] 实际使用：%s —— 加速后端没能加载，已自动退回 CPU"
+                  "（功能不受影响，只是慢一些）" % self.device_used)
 
         # --- 特征索引（可选）---
         if index_path and os.path.isfile(index_path) and index_rate > 0:
@@ -429,6 +447,11 @@ class RvcPipeline:
         P = feats.shape[2]
         P_real = min(P, G)                    # 真实帧数（填充前），裁剪区间按它算
         if P > G:
+            # 正常路径不会走到这里（convert_file 按 self.gen_T 算步长）。
+            # 真走到了说明分块算错，输出会变短且时间轴错位 —— 宁可吵一句也别静默出坏音频。
+            if self.verbose:
+                print("[警告] 本块 %d 帧超出生成器容量 %d 帧，超出部分会被丢掉"
+                      "（输出可能比原音频短）。请检查模型旁挂 json 里的 gen_T。" % (P, G))
             feats = feats[:, :, :G]
             pitch, pitchf, p_len = pitch[:, :G], pitchf[:, :G], G
         elif P < G:
@@ -532,7 +555,11 @@ class RvcPipeline:
         # 切点过滤：段太短或离结尾太近的切点直接丢弃（否则尾部会剩几十毫秒的碎片，
         # ContentVec 的 Conv 栈在超短输入上会直接报 Invalid input shape）
         min_seg = int(1.5 * SR16K)
-        max_step = (GEN_T - self.t_pad2 // self.window - 2) * self.window   # 非末块最大前进步长
+        # ★ 必须用 self.gen_T（这个 ONNX 实际的定长帧数），不能用模块常量 GEN_T(1024)。
+        #   导入的模型可以是 --T 512/768 导出的，若按 1024 算步长，块会超过生成器
+        #   容量 → _run_chunk 里被截断 → 输出比输入短、一长段音频整段错位（听着像
+        #   "跳词/漏句"）。__init__ 的自检已经保证 self.gen_T 足够大，这里照它算就安全。
+        max_step = (self.gen_T - self.t_pad2 // self.window - 2) * self.window   # 非末块最大前进步长
         cuts, prev = [], 0
         for t in opt_ts:
             ta = (t // self.window) * self.window

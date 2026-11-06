@@ -56,9 +56,26 @@ def main():
     if os.path.splitext(src)[1].lower() not in AUDIO_EXT:
         print("[警告] 扩展名不在白名单里，仍然试一下。m4a/aac/wma 大概率失败，先转 mp3。")
 
-    model = args.model or os.path.join(args.model_dir, "myvoice51.onnx")
+    # 选模型：命令行显式给了就用给的；没给就用模型库里"当前激活"的那个。
+    # 原来硬编码 myvoice51.onnx —— 用户导入自己的模型（比如「姬子.onnx」）后，
+    # 不带 -m 跑命令行会直接报"缺模型文件"，明明模型就在 models 目录里。
+    model = args.model
     vec = os.path.join(args.model_dir, "vec768_dyn.onnx")
     rmvpe = os.path.join(args.model_dir, "rmvpe.onnx")
+    if not model:
+        try:
+            from rvc_cpu import models as mm
+            if os.path.abspath(args.model_dir) == os.path.abspath(mm.MODELS):
+                p = mm.paths_for()
+                model = p["gen"]
+                vec = p["vec"] or vec
+                rmvpe = p["rmv"] or rmvpe
+                if model and not args.quiet:
+                    print("使用模型库中当前激活的模型：%s" % os.path.basename(model))
+        except Exception:
+            pass
+        if not model:
+            model = os.path.join(args.model_dir, "myvoice51.onnx")
     missing = [p for p in (model, vec, rmvpe) if not os.path.isfile(p)]
     if missing:
         print("缺模型文件：\n  " + "\n  ".join(missing))
